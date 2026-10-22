@@ -1,0 +1,32 @@
+[
+  {
+    "role": "buyer",
+    "round": 1,
+    "proposal": {
+      "action": "offer",
+      "price": 35,
+      "quantity": 1,
+      "rationale": "Starting with an aggressive opening offer of $35.00 to anchor the negotiation well below our target threshold, allowing sufficient margin to negotiate up while remaining strictly within our budget constraints."
+    }
+  },
+  {
+    "role": "seller",
+    "round": 1,
+    "proposal": {
+      "action": "counter",
+      "price": 65,
+      "quantity": 1,
+      "rationale": "The Ergonomic Mechanical Keyboard features premium hot-swappable custom switches, gasket mounting, and durable PBT keycaps. Given its list price of $75.00, $35.00 is too low, but I can offer a discount to $65.00."
+    }
+  },
+  {
+    "role": "buyer",
+    "round": 2,
+    "proposal": {
+      "action": "counter",
+      "price": 45,
+      "quantity": 1,
+      "rationale": "Countering with $45.00 to show reasonable movement from our initial offer while keeping the negotiation firmly within our strict budget ceiling and below our human approval threshold."
+    }
+  }
+]
