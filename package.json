@@ -10,6 +10,7 @@
     "lint": "next lint",
     "test:policy": "tsx tests/policy.test.ts",
     "test:audit": "tsx tests/audit.test.ts",
+    "test:negotiation": "tsx tests/negotiation.test.ts",
     "spike:paypal": "tsx lib/paypal/spike.ts"
   },
   "dependencies": {

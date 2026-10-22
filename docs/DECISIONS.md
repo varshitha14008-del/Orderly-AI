@@ -65,3 +65,16 @@ This document records key technical decisions, rationale, API constraints, and s
 | **PayPal Agent Toolkit** | Load `@paypal/agent-toolkit/ai-sdk` | Successfully loaded 47 tools (`create_order`, `get_order`, `pay_order`, `list_disputes`, etc.) | **PASS** |
 | **Google Gemini SDK** | Structured output JSON schema | Output parsed into `{ action: 'offer', price: 38, rationale: '...' }` using `gemini-3.5-flash` | **PASS** |
 
+---
+
+## Milestone 2 Verification Results: Policy Engine, Audit Ledger & Gemini Agents
+
+| Component | Tested Action | Verified Live Result | Status |
+|---|---|---|---|
+| **Policy Engine** | Pure TS rules enforcement | 12/12 unit tests passed (buyer ceiling, floor price, bundle discount thresholds, forbidden claims, malformed payloads). | **PASS** |
+| **Audit Ledger** | SHA-256 Hash Chaining | 4/4 unit tests passed (genesis block, sequential hash-chain, tamper detection on payload alteration, tamper detection on broken linkage). | **PASS** |
+| **Buyer & Seller Agents** | Live Gemini Negotiation | Negotiated live over 6 turns; adhered strictly to JSON schema and policy limits. | **PASS** |
+| **429 Quota Resilience** | Automatic fallback switch | When Gemini free-tier quota (5 RPM) triggers HTTP 429, seamlessly switches to deterministic fallback proposal without error. | **PASS** |
+| **Replay Mode** | `REPLAY_MODE=true` | Recorded negotiations replay deterministically in milliseconds without consuming LLM quota, ideal for demo video recording. | **PASS** |
+
+
