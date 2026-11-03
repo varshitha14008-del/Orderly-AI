@@ -88,7 +88,12 @@ export default function MerchantHubPage() {
     const session = sessions.find((s) => s.id === selectedSessionId);
     const captureId = session?.paypalCaptureId || "MOCK_SANDBOX_CAPTURE";
 
-    setRefundStatus("Executing PayPal Payments v2 refund...");
+    const isContest = recommendation.decision === "contest" || recommendation.refund_amount === 0;
+    setRefundStatus(
+      isContest
+        ? "Recording Mediator contest ruling..."
+        : "Executing PayPal Payments v2 refund..."
+    );
 
     try {
       const res = await fetch("/api/disputes/refund", {
@@ -98,20 +103,31 @@ export default function MerchantHubPage() {
           sessionId: selectedSessionId,
           captureId,
           amount: recommendation.refund_amount,
+          decision: recommendation.decision,
           note: `Approved via Orderly-AI AI Mediator: ${recommendation.decision}`,
         }),
       });
 
       const data = await res.json();
-      if (data.refund) {
-        setRefundResult(data.refund);
-        setRefundStatus(`Refund successfully executed in PayPal Sandbox! ID: ${data.refund.id}`);
+      if (data.success) {
+        if (data.refundIssued === false) {
+          setRefundResult(data);
+          setRefundStatus(
+            data.message ||
+              "Contest ruling approved and recorded. No refund issued as claim is contested per merchant policy."
+          );
+        } else if (data.refund) {
+          setRefundResult(data.refund);
+          setRefundStatus(
+            `Refund successfully executed in PayPal Sandbox! ID: ${data.refund.id}`
+          );
+        }
         fetchSessions();
       } else {
-        setRefundStatus(`Refund failed: ${data.error}`);
+        setRefundStatus(`Action failed: ${data.error}`);
       }
     } catch (err: any) {
-      setRefundStatus(`Refund request error: ${err.message}`);
+      setRefundStatus(`Request error: ${err.message}`);
     }
   };
 
@@ -408,7 +424,11 @@ export default function MerchantHubPage() {
                         className="w-full py-2.5 px-4 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-black font-bold text-xs shadow-md shadow-emerald-500/20 flex items-center justify-center gap-2 transition-all"
                       >
                         <CheckCircle2 className="w-4 h-4" />
-                        <span>1-Click Approve Ruling & Settle in PayPal</span>
+                        <span>
+                          {recommendation.decision === "contest"
+                            ? "1-Click Approve Contest Ruling (No Refund)"
+                            : "1-Click Approve Ruling & Settle in PayPal"}
+                        </span>
                       </button>
 
                       {refundStatus && (

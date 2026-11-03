@@ -36,6 +36,15 @@ export interface CaptureDetailsResponse {
  * Endpoint: POST /v2/payments/captures/{capture_id}/refund
  */
 export async function refundCapture(params: RefundCaptureParams): Promise<RefundResponse> {
+  // Validate that refund amount, if specified, is positive and greater than zero
+  if (typeof params.amount === "number") {
+    if (isNaN(params.amount) || params.amount <= 0) {
+      throw new Error(
+        `Invalid refund amount: ${params.amount}. Refund amount must be a positive number greater than zero.`
+      );
+    }
+  }
+
   const token = await getPayPalAccessToken();
   const baseUrl = getPayPalBaseUrl();
   const requestId = params.requestId || `refund_${params.captureId}_${Date.now()}`;
