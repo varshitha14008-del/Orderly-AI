@@ -161,4 +161,11 @@ class AuditLedger {
 }
 
 // Global singleton instance
-export const auditLedger = new AuditLedger();
+const globalForAudit = globalThis as unknown as {
+  __orderlyAuditLedger?: AuditLedger;
+};
+
+export const auditLedger: AuditLedger =
+  globalForAudit.__orderlyAuditLedger ?? new AuditLedger();
+
+globalForAudit.__orderlyAuditLedger = auditLedger;

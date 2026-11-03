@@ -6,33 +6,50 @@ import { auditLedger } from "@/lib/audit/ledger";
 export async function POST(req: Request) {
   try {
     const body = await req.json();
-    const { sessionId } = body;
+    const { sessionId, amount, description } = body;
 
-    const session = NegotiationManager.getSession(sessionId);
-    if (!session) {
-      return NextResponse.json({ error: "Session not found" }, { status: 404 });
-    }
+    // 1. Look up existing session in negotiation manager
+    let session = sessionId ? NegotiationManager.getSession(sessionId) : undefined;
 
-    if (!session.agreedPrice) {
+    // 2. Resolve agreed settlement price: from session or fallback to provided amount
+    const agreedPrice =
+      session?.agreedPrice ??
+      (typeof amount === "number" && !isNaN(amount) && amount > 0 ? amount : null);
+
+    if (!agreedPrice) {
+      if (!session && !amount) {
+        return NextResponse.json(
+          { error: "Session not found and no settlement amount provided" },
+          { status: 404 }
+        );
+      }
       return NextResponse.json(
-        { error: "Cannot create order: No agreed price in negotiation session" },
+        { error: "Cannot create order: No agreed settlement price found or provided" },
         { status: 400 }
       );
     }
 
-    // Call PayPal Orders v2
+    const itemDescription =
+      description ||
+      (session ? `${session.product.title} (Negotiated Agreement)` : "Orderly-AI Negotiated Agreement");
+
+    const customId = session ? session.id : (sessionId || `deal_${Date.now()}`);
+
+    // 3. Call PayPal Orders v2 with agreed settlement amount
     const order = await createOrder({
-      amount: session.agreedPrice,
-      customId: session.id,
-      description: `${session.product.title} (Negotiated Agreement)`,
+      amount: agreedPrice,
+      customId,
+      description: itemDescription,
     });
 
-    NegotiationManager.attachPayPalOrder(session.id, order.id);
+    if (session) {
+      NegotiationManager.attachPayPalOrder(session.id, order.id);
+    }
 
     auditLedger.record("paypal_api", "PAYPAL_ORDER_CREATED", {
-      sessionId: session.id,
+      sessionId: customId,
       orderId: order.id,
-      amount: session.agreedPrice,
+      amount: agreedPrice,
       status: order.status,
     });
 

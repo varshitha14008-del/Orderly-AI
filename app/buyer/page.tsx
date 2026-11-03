@@ -390,7 +390,7 @@ export default function BuyerPortalPage() {
                           </span>
                         )}
                         {!turn.fallback && (
-                          <span className="text-[10px] bg-cyan-500/10 text-cyan-300 px-1.5 py-0.2 rounded border border-cyan-500/20">
+                          <span className="text-[10px] bg-cyan-500/10 text-cyan-300 border border-cyan-500/20">
                             Gemini 3.5
                           </span>
                         )}
@@ -488,10 +488,15 @@ export default function BuyerPortalPage() {
                       <PayPalButtons
                         style={{ layout: "vertical", shape: "rect", color: "gold" }}
                         createOrder={async () => {
+                          const agreedAmount = session.agreedPrice || 60.0;
                           const res = await fetch("/api/orders/create", {
                             method: "POST",
                             headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ sessionId: session.id }),
+                            body: JSON.stringify({
+                              sessionId: session.id,
+                              amount: agreedAmount,
+                              description: `${session.product.title} (Negotiated Agreement)`,
+                            }),
                           });
                           const data = await res.json();
                           if (!data.orderId) throw new Error(data.error || "Order creation failed");
@@ -513,7 +518,16 @@ export default function BuyerPortalPage() {
                               orderId: data.orderID,
                               captureId: result.captureId,
                             });
+                          } else {
+                            setStatusMessage(`Payment capture failed: ${result.error || "Capture was not successful"}`);
                           }
+                        }}
+                        onError={(err) => {
+                          console.error("[PayPal Checkout Error]", err);
+                          setStatusMessage(`PayPal checkout error: ${err.message || "Transaction could not be completed"}`);
+                        }}
+                        onCancel={() => {
+                          setStatusMessage("PayPal checkout cancelled by buyer.");
                         }}
                       />
                     </PayPalScriptProvider>

@@ -44,7 +44,14 @@ export interface NegotiationSession {
 }
 
 // In-memory store for negotiation sessions
-const sessionsMap = new Map<string, NegotiationSession>();
+const globalForSessions = globalThis as unknown as {
+  __orderlySessionsMap?: Map<string, NegotiationSession>;
+};
+
+const sessionsMap: Map<string, NegotiationSession> =
+  globalForSessions.__orderlySessionsMap ?? new Map<string, NegotiationSession>();
+
+globalForSessions.__orderlySessionsMap = sessionsMap;
 
 export class NegotiationManager {
   /**

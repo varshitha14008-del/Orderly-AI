@@ -69,7 +69,7 @@ function runAuditTests() {
     const check = auditLedger.verifyIntegrity(entries);
     assert(check.valid === false, "Must detect modified payload");
     assert(check.brokenIndex === 1, "Must pinpoint tampered index #1");
-    assert(check.error?.includes("Tamper detected"), "Must report tamper detected");
+    assert(Boolean(check.error?.includes("Tamper detected")), "Must report tamper detected");
   });
 
   // 4. Tamper detection on broken linkage
