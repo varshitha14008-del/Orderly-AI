@@ -27,8 +27,31 @@ export interface CaptureDetailsResponse {
     value: string;
     currency_code: string;
   };
-  final_capture: boolean;
-  create_time: string;
+  seller_receivable_breakdown?: {
+    gross_amount?: {
+      value: string;
+      currency_code: string;
+    };
+    paypal_fee?: {
+      value: string;
+      currency_code: string;
+    };
+    net_amount?: {
+      value: string;
+      currency_code: string;
+    };
+    total_refunded_amount?: {
+      value: string;
+      currency_code: string;
+    };
+  };
+  final_capture?: boolean;
+  create_time?: string;
+  links?: Array<{
+    href: string;
+    rel: string;
+    method?: string;
+  }>;
 }
 
 /**

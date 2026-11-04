@@ -17,6 +17,13 @@ function assert(condition: any, message: string): asserts condition {
   }
 }
 
+interface MockCaptureState {
+  id: string;
+  status: "COMPLETED" | "PARTIALLY_REFUNDED" | "REFUNDED" | "DECLINED" | "PENDING";
+  amount: { value: string; currency_code: string };
+  totalRefunded: number;
+}
+
 async function runOrdersApiTests() {
   console.log("=================================================");
   console.log("   PAYPAL ORDERS, CAPTURE & REFUND API TESTS");
@@ -44,10 +51,17 @@ async function runOrdersApiTests() {
   process.env.PAYPAL_ENV = "sandbox";
 
   let paypalRefundApiCallCount = 0;
+  let paypalGetCaptureCallCount = 0;
+  let mockRefundResponseStatus: "COMPLETED" | "PENDING" | "FAILED" = "COMPLETED";
+
+  const mockCaptures = new Map<string, MockCaptureState>();
 
   function setupMockPayPalFetch() {
     invalidateCachedToken();
     paypalRefundApiCallCount = 0;
+    paypalGetCaptureCallCount = 0;
+    mockRefundResponseStatus = "COMPLETED";
+    mockCaptures.clear();
 
     globalThis.fetch = async (url: any, init?: any): Promise<Response> => {
       const urlStr = String(url);
@@ -67,7 +81,7 @@ async function runOrdersApiTests() {
       // Mock Orders v2 Create
       if (urlStr.includes("/v2/checkout/orders") && init?.method === "POST" && !urlStr.includes("/capture")) {
         const body = JSON.parse(init.body || "{}");
-        const orderAmount = body.purchase_units?.[0]?.amount?.value;
+        const orderAmount = body.purchase_units?.[0]?.amount?.value || "60.00";
         const customId = body.purchase_units?.[0]?.custom_id;
 
         return new Response(
@@ -112,15 +126,76 @@ async function runOrdersApiTests() {
         );
       }
 
-      // Mock Payments v2 Refund
+      // Mock Payments v2 Get Capture (GET /v2/payments/captures/{id})
+      if (urlStr.includes("/v2/payments/captures/") && (!init?.method || init?.method === "GET")) {
+        paypalGetCaptureCallCount++;
+        const parts = urlStr.split("/v2/payments/captures/")[1].split("/")[0].split("?")[0];
+        const captureId = parts;
+
+        const cap = mockCaptures.get(captureId) || {
+          id: captureId,
+          status: "COMPLETED",
+          amount: { value: "60.00", currency_code: "USD" },
+          totalRefunded: 0,
+        };
+
+        const responsePayload: any = {
+          id: cap.id,
+          status: cap.status,
+          amount: cap.amount,
+          final_capture: true,
+          create_time: new Date().toISOString(),
+        };
+
+        if (cap.totalRefunded > 0) {
+          responsePayload.seller_receivable_breakdown = {
+            total_refunded_amount: {
+              value: cap.totalRefunded.toFixed(2),
+              currency_code: cap.amount.currency_code,
+            },
+          };
+        }
+
+        return new Response(JSON.stringify(responsePayload), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      // Mock Payments v2 Refund (POST /v2/payments/captures/{id}/refund)
       if (urlStr.includes("/refund") && init?.method === "POST") {
         paypalRefundApiCallCount++;
         const body = JSON.parse(init.body || "{}");
         const refundVal = body.amount?.value || "60.00";
+        const refundValNum = parseFloat(refundVal);
+
+        // Extract captureId from URL: .../captures/{id}/refund
+        const parts = urlStr.split("/v2/payments/captures/")[1].split("/refund")[0];
+        const captureId = parts;
+
+        // Update state in mock captures
+        const cap = mockCaptures.get(captureId) || {
+          id: captureId,
+          status: "COMPLETED",
+          amount: { value: "60.00", currency_code: "USD" },
+          totalRefunded: 0,
+        };
+
+        if (mockRefundResponseStatus === "COMPLETED") {
+          cap.totalRefunded += refundValNum;
+          const origVal = parseFloat(cap.amount.value);
+          if (cap.totalRefunded >= origVal) {
+            cap.status = "REFUNDED";
+          } else {
+            cap.status = "PARTIALLY_REFUNDED";
+          }
+          mockCaptures.set(captureId, cap);
+        }
+
         return new Response(
           JSON.stringify({
-            id: "REFUND-MOCK-112233",
-            status: "COMPLETED",
+            id: `REFUND-MOCK-${Date.now().toString(36)}`,
+            status: mockRefundResponseStatus,
             amount: { value: refundVal, currency_code: "USD" },
             create_time: new Date().toISOString(),
           }),
@@ -168,20 +243,23 @@ async function runOrdersApiTests() {
       // Verify audit record
       const auditEntries = auditLedger.getEntries();
       const lastAudit = auditEntries[auditEntries.length - 1];
-      assert(lastAudit.type === "ORDER_ATTACHED_TO_SESSION" || lastAudit.type === "PAYPAL_ORDER_CREATED", "Audit ledger must record order creation");
+      assert(
+        lastAudit.type === "ORDER_ATTACHED_TO_SESSION" || lastAudit.type === "PAYPAL_ORDER_CREATED",
+        "Must log order creation or attachment"
+      );
     });
 
     // -------------------------------------------------------------
-    // Test 2: Create Order Fallback to Explicit Amount ($60.00)
+    // Test 2: Create Order via Direct Amount ($60.00 fallback)
     // -------------------------------------------------------------
     await testCase("POST /api/orders/create: Creates order using explicit amount ($60.00) if session is unindexed", async () => {
       const req = new Request("http://localhost:3000/api/orders/create", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          sessionId: "unindexed_session_fallback",
+          sessionId: "neg-unindexed-123",
           amount: 60.0,
-          description: "Fallback Agreement",
+          description: "Direct Settlement Fallback",
         }),
       });
 
@@ -191,32 +269,36 @@ async function runOrdersApiTests() {
 
       assert(data.success === true, "Expected success true");
       assert(data.orderId === "ORDER-MOCK-998877", "Order ID must match mock");
+      assert(data.status === "CREATED", "Status must be CREATED");
     });
 
     // -------------------------------------------------------------
-    // Test 3: Reject Order Creation when No Price Available
+    // Test 3: Reject Order Creation Without Settlement Amount
     // -------------------------------------------------------------
     await testCase("POST /api/orders/create: Rejects order creation when no settlement amount is present", async () => {
+      const session = NegotiationManager.createSession("prod-kb-01");
+      session.agreedPrice = null; // Unsettled
+
       const req = new Request("http://localhost:3000/api/orders/create", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId: "non_existent_empty" }),
+        body: JSON.stringify({ sessionId: session.id }),
       });
 
       const res = await createOrderRoute(req);
-      assert(res.status === 404, `Expected status 404, got ${res.status}`);
+      assert(res.status === 400, `Expected status 400, got ${res.status}`);
       const data = await res.json();
-      assert(data.error.includes("Session not found"), "Must report session not found");
+      assert(data.error.includes("No agreed settlement price"), "Must report missing settlement price");
     });
 
     // -------------------------------------------------------------
-    // Test 4: Capture Order and Update Session
+    // Test 4: Capture Approved Order & Update Session Status
     // -------------------------------------------------------------
     await testCase("POST /api/orders/capture: Captures approved order and updates session", async () => {
       const session = NegotiationManager.createSession("prod-kb-01");
       session.agreedPrice = 60.0;
-      session.paypalOrderId = "ORDER-MOCK-998877";
       session.status = "AGREED";
+      session.paypalOrderId = "ORDER-MOCK-998877";
 
       const req = new Request("http://localhost:3000/api/orders/capture", {
         method: "POST",
@@ -263,14 +345,15 @@ async function runOrdersApiTests() {
     });
 
     // =============================================================
-    // MEDIATOR & REFUND INTEGRATION TESTS
+    // PAYPAL PAYMENTS V2 REFUND & CAPTURE BALANCE TESTS
     // =============================================================
 
     // -------------------------------------------------------------
-    // Test 6: Contest Ruling ($0 Refund) - NO PayPal API Call
+    // Test 6: Contest Ruling - Neither getCapture NOR refund API Called
     // -------------------------------------------------------------
-    await testCase("POST /api/disputes/refund: Contest with $0 refund does NOT call PayPal API and records ruling", async () => {
-      const callCountBefore = paypalRefundApiCallCount;
+    await testCase("POST /api/disputes/refund: Contest decision without any PayPal API call", async () => {
+      const refundCallsBefore = paypalRefundApiCallCount;
+      const getCaptureCallsBefore = paypalGetCaptureCallCount;
 
       const req = new Request("http://localhost:3000/api/disputes/refund", {
         method: "POST",
@@ -291,20 +374,31 @@ async function runOrdersApiTests() {
       assert(data.success === true, "Expected success: true");
       assert(data.decision === "contest", "Expected decision: contest");
       assert(data.refundIssued === false, "Expected refundIssued: false");
-      assert(paypalRefundApiCallCount === callCountBefore, "PayPal refund API must NOT be called for contest with $0");
+      assert(paypalRefundApiCallCount === refundCallsBefore, "refundCapture must NOT be called for contest");
+      assert(paypalGetCaptureCallCount === getCaptureCallsBefore, "getCapture must NOT be called for contest");
 
       // Verify audit record exists
       const entries = auditLedger.getEntries();
-      const contestAudit = entries.find((e) => e.type === "DISPUTE_CONTEST_RULING_RECORDED" && e.payload?.captureId === "CAP-CONTEST-123");
+      const contestAudit = entries.find(
+        (e) => e.type === "DISPUTE_CONTEST_RULING_RECORDED" && e.payload?.captureId === "CAP-CONTEST-123"
+      );
       assert(contestAudit !== undefined, "Audit ledger must record DISPUTE_CONTEST_RULING_RECORDED");
-      assert(contestAudit.payload.refundAmount === 0, "Audit payload refund amount must be 0");
+      assert(contestAudit.payload?.refundAmount === 0, "Audit payload refund amount must be 0");
     });
 
     // -------------------------------------------------------------
-    // Test 7: Full Refund (> $0) - Calls PayPal API
+    // Test 7: Full Refund When Nothing Previously Refunded
     // -------------------------------------------------------------
-    await testCase("POST /api/disputes/refund: Full refund calls PayPal Payments v2 API and logs execution", async () => {
-      const callCountBefore = paypalRefundApiCallCount;
+    await testCase("POST /api/disputes/refund: Full refund when nothing has previously been refunded", async () => {
+      mockCaptures.set("CAP-FULL-456", {
+        id: "CAP-FULL-456",
+        status: "COMPLETED",
+        amount: { value: "60.00", currency_code: "USD" },
+        totalRefunded: 0,
+      });
+
+      const refundCallsBefore = paypalRefundApiCallCount;
+      const getCaptureCallsBefore = paypalGetCaptureCallCount;
 
       const req = new Request("http://localhost:3000/api/disputes/refund", {
         method: "POST",
@@ -323,21 +417,65 @@ async function runOrdersApiTests() {
       const data = await res.json();
 
       assert(data.success === true, "Expected success: true");
+      assert(data.status === "COMPLETED", "Expected status: COMPLETED");
       assert(data.refundIssued === true, "Expected refundIssued: true");
-      assert(data.refund?.id === "REFUND-MOCK-112233", "Expected mock refund id");
-      assert(paypalRefundApiCallCount === callCountBefore + 1, "PayPal refund API must be called exactly once");
+      assert(data.remainingBalance === 0, "Expected remainingBalance: 0");
+      assert(paypalGetCaptureCallCount === getCaptureCallsBefore + 1, "getCapture must be called before refund");
+      assert(paypalRefundApiCallCount === refundCallsBefore + 1, "PayPal refund API must be called exactly once");
 
       // Verify audit record exists
       const entries = auditLedger.getEntries();
-      const refundAudit = entries.find((e) => e.type === "REFUND_APPROVED_AND_EXECUTED" && e.payload?.captureId === "CAP-FULL-456");
+      const refundAudit = entries.find(
+        (e) => e.type === "REFUND_APPROVED_AND_EXECUTED" && e.payload?.captureId === "CAP-FULL-456"
+      );
       assert(refundAudit !== undefined, "Audit ledger must record REFUND_APPROVED_AND_EXECUTED");
     });
 
     // -------------------------------------------------------------
-    // Test 8: Partial Refund (> $0) - Calls PayPal API
+    // Test 8: Rejection When Capture Is Already Fully Refunded
     // -------------------------------------------------------------
-    await testCase("POST /api/disputes/refund: Partial refund calls PayPal API with 50% amount", async () => {
-      const callCountBefore = paypalRefundApiCallCount;
+    await testCase("POST /api/disputes/refund: Rejection when the capture is already fully refunded", async () => {
+      mockCaptures.set("CAP-ALREADY-REFUNDED-01", {
+        id: "CAP-ALREADY-REFUNDED-01",
+        status: "REFUNDED",
+        amount: { value: "60.00", currency_code: "USD" },
+        totalRefunded: 60.0,
+      });
+
+      const refundCallsBefore = paypalRefundApiCallCount;
+
+      const req = new Request("http://localhost:3000/api/disputes/refund", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: "neg-dup-01",
+          captureId: "CAP-ALREADY-REFUNDED-01",
+          amount: 60.0,
+          decision: "full_refund",
+        }),
+      });
+
+      const res = await refundRoute(req);
+      assert(res.status === 400, `Expected status 400, got ${res.status}`);
+      const data = await res.json();
+
+      assert(data.error.includes("already fully refunded"), "Error must state capture is already fully refunded");
+      assert(data.remainingBalance === 0, "Remaining balance must be 0");
+      assert(paypalRefundApiCallCount === refundCallsBefore, "PayPal refund API must NOT be called");
+    });
+
+    // -------------------------------------------------------------
+    // Test 9: Partial Refund When Sufficient Balance Remains
+    // -------------------------------------------------------------
+    await testCase("POST /api/disputes/refund: Partial refund when sufficient balance remains", async () => {
+      mockCaptures.set("CAP-PARTIAL-789", {
+        id: "CAP-PARTIAL-789",
+        status: "COMPLETED",
+        amount: { value: "60.00", currency_code: "USD" },
+        totalRefunded: 0,
+      });
+
+      const refundCallsBefore = paypalRefundApiCallCount;
 
       const req = new Request("http://localhost:3000/api/disputes/refund", {
         method: "POST",
@@ -356,13 +494,172 @@ async function runOrdersApiTests() {
       const data = await res.json();
 
       assert(data.success === true, "Expected success: true");
+      assert(data.status === "COMPLETED", "Expected status: COMPLETED");
       assert(data.refundIssued === true, "Expected refundIssued: true");
-      assert(data.refund?.amount?.value === "30.00", "Refund amount value must match 30.00");
-      assert(paypalRefundApiCallCount === callCountBefore + 1, "PayPal refund API must be called for partial refund");
+      assert(data.remainingBalance === 30.0, "Expected remainingBalance: 30.00");
+      assert(paypalRefundApiCallCount === refundCallsBefore + 1, "PayPal refund API must be called for partial refund");
     });
 
     // -------------------------------------------------------------
-    // Test 9: Invalid Negative Refund Amount - Rejected Before API Call
+    // Test 10: Rejection When Requested Amount Exceeds Remaining Balance
+    // -------------------------------------------------------------
+    await testCase("POST /api/disputes/refund: Rejection when requested amount exceeds remaining balance", async () => {
+      mockCaptures.set("CAP-LOW-BALANCE-01", {
+        id: "CAP-LOW-BALANCE-01",
+        status: "PARTIALLY_REFUNDED",
+        amount: { value: "60.00", currency_code: "USD" },
+        totalRefunded: 40.0, // Remaining balance is $20.00
+      });
+
+      const refundCallsBefore = paypalRefundApiCallCount;
+
+      const req = new Request("http://localhost:3000/api/disputes/refund", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: "neg-exceed-01",
+          captureId: "CAP-LOW-BALANCE-01",
+          amount: 25.0, // Exceeds $20.00 remaining
+          decision: "partial_refund",
+        }),
+      });
+
+      const res = await refundRoute(req);
+      assert(res.status === 400, `Expected status 400, got ${res.status}`);
+      const data = await res.json();
+
+      assert(data.error.includes("exceeds remaining refundable balance"), "Error must state amount exceeds balance");
+      assert(data.remainingBalance === 20.0, "Remaining balance must report 20.00");
+      assert(paypalRefundApiCallCount === refundCallsBefore, "PayPal refund API must NOT be called");
+    });
+
+    // -------------------------------------------------------------
+    // Test 11: Second Partial Refund Within Remaining Balance
+    // -------------------------------------------------------------
+    await testCase("POST /api/disputes/refund: A second partial refund within the remaining balance", async () => {
+      mockCaptures.set("CAP-MULTI-PARTIAL-01", {
+        id: "CAP-MULTI-PARTIAL-01",
+        status: "PARTIALLY_REFUNDED",
+        amount: { value: "60.00", currency_code: "USD" },
+        totalRefunded: 30.0, // Remaining balance is $30.00
+      });
+
+      const refundCallsBefore = paypalRefundApiCallCount;
+
+      const req = new Request("http://localhost:3000/api/disputes/refund", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: "neg-multi-01",
+          captureId: "CAP-MULTI-PARTIAL-01",
+          amount: 20.0, // Legitimate $20 refund <= $30 remaining
+          decision: "partial_refund",
+          note: "Second partial refund.",
+        }),
+      });
+
+      const res = await refundRoute(req);
+      assert(res.status === 200, `Expected status 200, got ${res.status}`);
+      const data = await res.json();
+
+      assert(data.success === true, "Expected success: true");
+      assert(data.status === "COMPLETED", "Expected status: COMPLETED");
+      assert(data.remainingBalance === 10.0, "Expected remaining balance to be 10.00");
+      assert(paypalRefundApiCallCount === refundCallsBefore + 1, "PayPal refund API must be called");
+    });
+
+    // -------------------------------------------------------------
+    // Test 12: Pending Refund Response Not Reported as Completed
+    // -------------------------------------------------------------
+    await testCase("POST /api/disputes/refund: Pending refund response not reported as completed", async () => {
+      mockCaptures.set("CAP-PENDING-01", {
+        id: "CAP-PENDING-01",
+        status: "COMPLETED",
+        amount: { value: "60.00", currency_code: "USD" },
+        totalRefunded: 0,
+      });
+
+      mockRefundResponseStatus = "PENDING";
+
+      const req = new Request("http://localhost:3000/api/disputes/refund", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: "neg-pending-01",
+          captureId: "CAP-PENDING-01",
+          amount: 60.0,
+          decision: "full_refund",
+        }),
+      });
+
+      const res = await refundRoute(req);
+      assert(res.status === 200, `Expected status 200, got ${res.status}`);
+      const data = await res.json();
+
+      assert(data.success === true, "Expected success: true");
+      assert(data.status === "PENDING", "Expected status to be PENDING");
+      assert(data.refundIssued === false, "refundIssued must be false for pending refunds");
+      assert(data.pending === true, "pending flag must be true");
+
+      // Verify audit entry is REFUND_PENDING_APPROVAL, NOT REFUND_APPROVED_AND_EXECUTED
+      const entries = auditLedger.getEntries();
+      const pendingAudit = entries.find(
+        (e) => e.type === "REFUND_PENDING_APPROVAL" && e.payload?.captureId === "CAP-PENDING-01"
+      );
+      assert(pendingAudit !== undefined, "Audit ledger must record REFUND_PENDING_APPROVAL");
+
+      const executedAudit = entries.find(
+        (e) => e.type === "REFUND_APPROVED_AND_EXECUTED" && e.payload?.captureId === "CAP-PENDING-01"
+      );
+      assert(executedAudit === undefined, "Pending refund must NOT be recorded as REFUND_APPROVED_AND_EXECUTED");
+
+      mockRefundResponseStatus = "COMPLETED";
+    });
+
+    // -------------------------------------------------------------
+    // Test 13: Failed Refund Response Not Reported as Successful
+    // -------------------------------------------------------------
+    await testCase("POST /api/disputes/refund: Failed refund response not reported as successful", async () => {
+      mockCaptures.set("CAP-FAILED-01", {
+        id: "CAP-FAILED-01",
+        status: "COMPLETED",
+        amount: { value: "60.00", currency_code: "USD" },
+        totalRefunded: 0,
+      });
+
+      mockRefundResponseStatus = "FAILED";
+
+      const req = new Request("http://localhost:3000/api/disputes/refund", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: "neg-fail-01",
+          captureId: "CAP-FAILED-01",
+          amount: 60.0,
+          decision: "full_refund",
+        }),
+      });
+
+      const res = await refundRoute(req);
+      assert(res.status === 400, `Expected status 400 for failed refund, got ${res.status}`);
+      const data = await res.json();
+
+      assert(data.success === false, "success must be false for failed refund");
+      assert(data.status === "FAILED", "status must be FAILED");
+      assert(data.error.includes("failed with status: FAILED"), "Error message must report failure");
+
+      // Verify audit entry is REFUND_EXECUTION_FAILED
+      const entries = auditLedger.getEntries();
+      const failedAudit = entries.find(
+        (e) => e.type === "REFUND_EXECUTION_FAILED" && e.payload?.captureId === "CAP-FAILED-01"
+      );
+      assert(failedAudit !== undefined, "Audit ledger must record REFUND_EXECUTION_FAILED");
+
+      mockRefundResponseStatus = "COMPLETED";
+    });
+
+    // -------------------------------------------------------------
+    // Test 14: Invalid Negative Refund Amount - Rejected Before API Call
     // -------------------------------------------------------------
     await testCase("POST /api/disputes/refund: Invalid negative refund amount rejected with HTTP 400 before API call", async () => {
       const callCountBefore = paypalRefundApiCallCount;
@@ -387,7 +684,7 @@ async function runOrdersApiTests() {
     });
 
     // -------------------------------------------------------------
-    // Test 10: payments.ts refundCapture throws on non-positive amount
+    // Test 15: payments.ts refundCapture throws on non-positive amount
     // -------------------------------------------------------------
     await testCase("lib/paypal/payments: refundCapture strictly throws on zero or negative amounts", async () => {
       let threwZero = false;
