@@ -19,6 +19,111 @@ export interface NegotiationTurnRecord {
   timestamp: string;
 }
 
+export const VALID_NEGOTIATION_STATUSES: NegotiationStatus[] = [
+  "INITIAL",
+  "IN_PROGRESS",
+  "AGREED",
+  "AWAITING_HUMAN_APPROVAL",
+  "REJECTED",
+  "COMPLETED",
+];
+
+export function isAllowedStateTransition(from: NegotiationStatus, to: NegotiationStatus): boolean {
+  if (from === to) return true;
+
+  switch (from) {
+    case "INITIAL":
+      return (
+        to === "IN_PROGRESS" ||
+        to === "AGREED" ||
+        to === "AWAITING_HUMAN_APPROVAL" ||
+        to === "REJECTED" ||
+        to === "COMPLETED"
+      );
+    case "IN_PROGRESS":
+      return (
+        to === "IN_PROGRESS" ||
+        to === "AGREED" ||
+        to === "AWAITING_HUMAN_APPROVAL" ||
+        to === "REJECTED" ||
+        to === "COMPLETED"
+      );
+    case "AGREED":
+      return to === "AWAITING_HUMAN_APPROVAL" || to === "COMPLETED";
+    case "AWAITING_HUMAN_APPROVAL":
+      return to === "AGREED" || to === "COMPLETED" || to === "REJECTED";
+    case "REJECTED":
+      return false;
+    case "COMPLETED":
+      return false;
+    default:
+      return false;
+  }
+}
+
+export function validateSessionSnapshot(snapshot: any): asserts snapshot is NegotiationSession {
+  if (!snapshot || typeof snapshot !== "object") {
+    throw new Error("Invalid session snapshot: must be an object");
+  }
+
+  if (typeof snapshot.id !== "string" || !snapshot.id.trim()) {
+    throw new Error("Invalid session snapshot: missing or invalid session ID");
+  }
+
+  if (
+    !snapshot.product ||
+    typeof snapshot.product !== "object" ||
+    typeof snapshot.product.id !== "string" ||
+    typeof snapshot.product.title !== "string" ||
+    typeof snapshot.product.listPrice !== "number" ||
+    isNaN(snapshot.product.listPrice)
+  ) {
+    throw new Error("Invalid session snapshot: missing or invalid product details");
+  }
+
+  if (
+    !snapshot.buyerPolicy ||
+    typeof snapshot.buyerPolicy !== "object" ||
+    typeof snapshot.buyerPolicy.max_price !== "number" ||
+    isNaN(snapshot.buyerPolicy.max_price)
+  ) {
+    throw new Error("Invalid session snapshot: missing or invalid buyer policy");
+  }
+
+  if (
+    !snapshot.merchantPolicy ||
+    typeof snapshot.merchantPolicy !== "object" ||
+    typeof snapshot.merchantPolicy.floor_price !== "number" ||
+    isNaN(snapshot.merchantPolicy.floor_price)
+  ) {
+    throw new Error("Invalid session snapshot: missing or invalid merchant policy");
+  }
+
+  if (
+    typeof snapshot.currentRound !== "number" ||
+    snapshot.currentRound < 1 ||
+    typeof snapshot.maxRounds !== "number" ||
+    snapshot.maxRounds < 1
+  ) {
+    throw new Error("Invalid session snapshot: invalid round numbers");
+  }
+
+  if (!VALID_NEGOTIATION_STATUSES.includes(snapshot.status)) {
+    throw new Error(`Invalid session snapshot: unknown status '${snapshot.status}'`);
+  }
+
+  if (!Array.isArray(snapshot.turns)) {
+    throw new Error("Invalid session snapshot: turns must be an array");
+  }
+
+  if (
+    snapshot.version !== undefined &&
+    (typeof snapshot.version !== "number" || isNaN(snapshot.version) || snapshot.version < 1)
+  ) {
+    throw new Error("Invalid session snapshot: version must be a positive number if provided");
+  }
+}
+
 export type NegotiationStatus =
   | "INITIAL"
   | "IN_PROGRESS"
@@ -39,6 +144,8 @@ export interface NegotiationSession {
   agreedPrice: number | null;
   paypalOrderId: string | null;
   paypalCaptureId: string | null;
+  paypalCaptureStatus?: string | null;
+  version: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -89,6 +196,8 @@ export class NegotiationManager {
       agreedPrice: null,
       paypalOrderId: null,
       paypalCaptureId: null,
+      paypalCaptureStatus: null,
+      version: 1,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
@@ -104,6 +213,62 @@ export class NegotiationManager {
     });
 
     return session;
+  }
+
+  /**
+   * Restores a negotiation session from a browser-provided snapshot into memory.
+   * Validates session ID, required fields, and allowed state transitions.
+   * Enforces strict monotonic versioning to guarantee a stale snapshot never overwrites a newer version.
+   */
+  static restoreSession(snapshot: NegotiationSession): NegotiationSession {
+    validateSessionSnapshot(snapshot);
+
+    const incomingVersion =
+      typeof snapshot.version === "number" && snapshot.version >= 1
+        ? snapshot.version
+        : Math.max(1, (snapshot.turns?.length || 0) + 1);
+
+    const normalizedSnapshot: NegotiationSession = {
+      ...snapshot,
+      version: incomingVersion,
+      paypalCaptureStatus: snapshot.paypalCaptureStatus ?? null,
+      updatedAt: snapshot.updatedAt || new Date().toISOString(),
+      createdAt: snapshot.createdAt || new Date().toISOString(),
+    };
+
+    const existing = sessionsMap.get(normalizedSnapshot.id);
+    if (!existing) {
+      sessionsMap.set(normalizedSnapshot.id, normalizedSnapshot);
+      return normalizedSnapshot;
+    }
+
+    const existingVersion =
+      typeof existing.version === "number" && existing.version >= 1
+        ? existing.version
+        : Math.max(1, (existing.turns?.length || 0) + 1);
+
+    // 1. Monotonic Version Guard: Stale snapshot must never overwrite newer version
+    if (incomingVersion < existingVersion) {
+      throw new Error(
+        `Stale session snapshot rejected for ${normalizedSnapshot.id}: snapshot version ${incomingVersion} is older than server version ${existingVersion}`
+      );
+    }
+
+    // 2. State Transition Guard: Disallow invalid transitions or terminal rollbacks
+    if (!isAllowedStateTransition(existing.status, normalizedSnapshot.status)) {
+      throw new Error(
+        `Illegal state transition for session ${normalizedSnapshot.id}: cannot transition from '${existing.status}' to '${normalizedSnapshot.status}'`
+      );
+    }
+
+    // 3. Identical version: equal versions represent the same logical state; always preserve existing server session
+    if (incomingVersion === existingVersion) {
+      return existing;
+    }
+
+    // 4. Accept newer snapshot
+    sessionsMap.set(normalizedSnapshot.id, normalizedSnapshot);
+    return normalizedSnapshot;
   }
 
   static getSession(id: string): NegotiationSession | undefined {
@@ -232,6 +397,7 @@ export class NegotiationManager {
       }
     }
 
+    session.version = (session.version ?? 1) + 1;
     session.updatedAt = new Date().toISOString();
     return session;
   }
@@ -254,18 +420,21 @@ export class NegotiationManager {
     const session = sessionsMap.get(sessionId);
     if (session) {
       session.paypalOrderId = orderId;
+      session.version = (session.version ?? 1) + 1;
       session.updatedAt = new Date().toISOString();
       auditLedger.record("paypal_api", "ORDER_ATTACHED_TO_SESSION", { sessionId, orderId });
     }
   }
 
-  static attachPayPalCapture(sessionId: string, captureId: string): void {
+  static attachPayPalCapture(sessionId: string, captureId: string, captureStatus: string = "COMPLETED"): void {
     const session = sessionsMap.get(sessionId);
     if (session) {
       session.paypalCaptureId = captureId;
+      session.paypalCaptureStatus = captureStatus;
       session.status = "COMPLETED";
+      session.version = (session.version ?? 1) + 1;
       session.updatedAt = new Date().toISOString();
-      auditLedger.record("paypal_api", "CAPTURE_ATTACHED_TO_SESSION", { sessionId, captureId });
+      auditLedger.record("paypal_api", "CAPTURE_ATTACHED_TO_SESSION", { sessionId, captureId, captureStatus });
     }
   }
 

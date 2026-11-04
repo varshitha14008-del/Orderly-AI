@@ -18,6 +18,37 @@ import {
 import { SEEDED_PRODUCTS } from "@/lib/negotiation/catalog";
 import { NegotiationSession } from "@/lib/negotiation/engine";
 import { MediationRecommendation } from "@/lib/agents/mediator";
+import {
+  getStoredSessions,
+  saveStoredSessions,
+  saveStoredSession,
+  appendStoredAuditEvents,
+} from "@/lib/storage/browserStore";
+
+function formatCaptureStatus(session: NegotiationSession): { label: string; color: string } {
+  if (!session.paypalCaptureId) {
+    return { label: "SIMULATED / NO CAPTURE", color: "text-slate-400" };
+  }
+
+  const raw = (session.paypalCaptureStatus || "").toUpperCase();
+
+  if (raw === "PENDING") {
+    return { label: "PENDING", color: "text-amber-400" };
+  }
+  if (raw === "COMPLETED") {
+    return { label: "CAPTURED", color: "text-emerald-400" };
+  }
+  if (raw === "PARTIALLY_REFUNDED") {
+    return { label: "PARTIALLY REFUNDED", color: "text-cyan-400" };
+  }
+  if (raw === "REFUNDED") {
+    return { label: "REFUNDED", color: "text-purple-400" };
+  }
+  if (raw === "DECLINED" || raw === "FAILED") {
+    return { label: raw, color: "text-rose-400" };
+  }
+  return raw ? { label: raw, color: "text-emerald-400" } : { label: "CAPTURED", color: "text-emerald-400" };
+}
 
 export default function MerchantHubPage() {
   const [sessions, setSessions] = useState<NegotiationSession[]>([]);
@@ -36,14 +67,16 @@ export default function MerchantHubPage() {
       const res = await fetch("/api/negotiations");
       const data = await res.json();
       if (data.sessions) {
-        setSessions(data.sessions);
-        if (data.sessions.length > 0 && !selectedSessionId) {
-          setSelectedSessionId(data.sessions[0].id);
-        }
+        saveStoredSessions(data.sessions);
       }
     } catch (err) {
       console.error("Failed to load sessions:", err);
     } finally {
+      const stored = getStoredSessions();
+      setSessions(stored);
+      if (stored.length > 0 && !selectedSessionId) {
+        setSelectedSessionId(stored[0].id);
+      }
       setLoading(false);
     }
   };
@@ -54,6 +87,7 @@ export default function MerchantHubPage() {
 
   const handleRunMediation = async () => {
     if (!selectedSessionId) return;
+    const session = sessions.find((s) => s.id === selectedSessionId);
     setMediating(true);
     setRecommendation(null);
     setRefundStatus("");
@@ -67,10 +101,14 @@ export default function MerchantHubPage() {
           sessionId: selectedSessionId,
           category: disputeCategory,
           notes: disputeNotes,
+          session,
         }),
       });
 
       const data = await res.json();
+      if (data.events) {
+        appendStoredAuditEvents(data.events);
+      }
       if (data.recommendation) {
         setRecommendation(data.recommendation);
       } else {
@@ -97,6 +135,13 @@ export default function MerchantHubPage() {
       return;
     }
 
+    if (!isContest && session?.paypalCaptureStatus === "PENDING") {
+      setRefundStatus(
+        "Cannot execute refund: PayPal capture is PENDING clearance. PayPal does not allow refunds on unsettled pending funds."
+      );
+      return;
+    }
+
 
     setRefundStatus(
       isContest
@@ -118,6 +163,9 @@ export default function MerchantHubPage() {
       });
 
       const data = await res.json();
+      if (data.events) {
+        appendStoredAuditEvents(data.events);
+      }
       if (data.success) {
         if (data.refundIssued === false) {
           setRefundResult(data);
@@ -130,6 +178,12 @@ export default function MerchantHubPage() {
           setRefundStatus(
             `Refund successfully executed in PayPal Sandbox! ID: ${data.refund.id}`
           );
+          if (session && data.status) {
+            saveStoredSession({
+              ...session,
+              paypalCaptureStatus: data.status,
+            });
+          }
         }
         fetchSessions();
       } else {
@@ -308,8 +362,8 @@ export default function MerchantHubPage() {
                   </div>
                   <div className="text-right font-mono text-xs">
                     <span className="text-slate-500 block text-[10px]">CAPTURE STATUS</span>
-                    <span className="text-emerald-400 font-bold">
-                      {selectedSession.paypalCaptureId ? "CAPTURED" : "SIMULATED / PENDING"}
+                    <span className={`font-bold ${formatCaptureStatus(selectedSession).color}`}>
+                      {formatCaptureStatus(selectedSession).label}
                     </span>
                   </div>
                 </div>
@@ -428,14 +482,38 @@ export default function MerchantHubPage() {
 
                     {/* Merchant Approval & Execution */}
                     <div className="pt-3 border-t border-white/10 space-y-3">
+                      {recommendation.decision !== "contest" &&
+                        recommendation.refund_amount > 0 &&
+                        selectedSession.paypalCaptureStatus === "PENDING" && (
+                          <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-xs text-amber-300 flex items-center gap-2">
+                            <AlertTriangle className="w-4 h-4 shrink-0 text-amber-400" />
+                            <span>
+                              PayPal capture status is PENDING. PayPal does not allow refunds on unsettled pending funds.
+                            </span>
+                          </div>
+                        )}
+
                       <button
+                        disabled={
+                          recommendation.decision !== "contest" &&
+                          recommendation.refund_amount > 0 &&
+                          selectedSession.paypalCaptureStatus === "PENDING"
+                        }
                         onClick={handleExecuteRefund}
-                        className="w-full py-2.5 px-4 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-black font-bold text-xs shadow-md shadow-emerald-500/20 flex items-center justify-center gap-2 transition-all"
+                        className={`w-full py-2.5 px-4 rounded-xl font-bold text-xs shadow-md flex items-center justify-center gap-2 transition-all ${
+                          recommendation.decision !== "contest" &&
+                          recommendation.refund_amount > 0 &&
+                          selectedSession.paypalCaptureStatus === "PENDING"
+                            ? "bg-slate-800 text-slate-500 border border-white/10 cursor-not-allowed"
+                            : "bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-black shadow-emerald-500/20"
+                        }`}
                       >
                         <CheckCircle2 className="w-4 h-4" />
                         <span>
                           {recommendation.decision === "contest"
                             ? "1-Click Approve Contest Ruling (No Refund)"
+                            : selectedSession.paypalCaptureStatus === "PENDING"
+                            ? "Refund Blocked: Capture is PENDING"
                             : "1-Click Approve Ruling & Settle in PayPal"}
                         </span>
                       </button>

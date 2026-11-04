@@ -117,7 +117,13 @@ export async function POST(req: Request) {
       const captureId = event.resource?.id;
       const customId = event.resource?.custom_id;
       if (customId && captureId && typeof captureId === "string") {
-        NegotiationManager.attachPayPalCapture(customId, captureId);
+        NegotiationManager.attachPayPalCapture(customId, captureId, "COMPLETED");
+      }
+    } else if (eventType === "PAYMENT.CAPTURE.PENDING") {
+      const captureId = event.resource?.id;
+      const customId = event.resource?.custom_id;
+      if (customId && captureId && typeof captureId === "string") {
+        NegotiationManager.attachPayPalCapture(customId, captureId, "PENDING");
       }
     }
 

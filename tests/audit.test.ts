@@ -3,7 +3,7 @@
  * Run with: npm run test:audit
  */
 
-import { auditLedger, computeEntryHash, AuditEntry } from "../lib/audit/ledger";
+import { auditLedger, computeEntryHash, AuditEntry, captureRequestAuditEvents } from "../lib/audit/ledger";
 
 function assert(condition: boolean, message: string) {
   if (!condition) {
@@ -11,7 +11,7 @@ function assert(condition: boolean, message: string) {
   }
 }
 
-function runAuditTests() {
+async function runAuditTests() {
   console.log("=================================================");
   console.log("      HASH-CHAINED AUDIT LEDGER UNIT TESTS");
   console.log("=================================================\n");
@@ -19,9 +19,9 @@ function runAuditTests() {
   let passed = 0;
   let failed = 0;
 
-  function testCase(name: string, fn: () => void) {
+  async function testCase(name: string, fn: () => Promise<void> | void) {
     try {
-      fn();
+      await fn();
       console.log(`[PASS] ${name}`);
       passed++;
     } catch (err: any) {
@@ -85,6 +85,61 @@ function runAuditTests() {
     const check = auditLedger.verifyIntegrity(entries);
     assert(check.valid === false, "Must detect broken linkage");
     assert(check.brokenIndex === 2, "Must pinpoint index #2");
+  });
+
+  // 5. Request-scoped audit event collection via AsyncLocalStorage
+  await testCase("captureRequestAuditEvents isolates request-scoped events", async () => {
+    auditLedger.reset();
+    auditLedger.record("system", "PRE_REQUEST_EVENT", { pre: true });
+
+    const { result, events } = await captureRequestAuditEvents(async () => {
+      auditLedger.record("buyer_agent", "INNER_REQUEST_EVENT_1", { price: 42 });
+      auditLedger.record("seller_agent", "INNER_REQUEST_EVENT_2", { price: 50 });
+      return { success: true };
+    });
+
+    auditLedger.record("system", "POST_REQUEST_EVENT", { post: true });
+
+    assert(result.success === true, "Result must match");
+    assert(events.length === 2, `Expected 2 scoped events, got ${events.length}`);
+    assert(events[0].type === "INNER_REQUEST_EVENT_1", "First scoped event matches");
+    assert(events[1].type === "INNER_REQUEST_EVENT_2", "Second scoped event matches");
+
+    const allEntries = auditLedger.getEntries();
+    assert(allEntries.length === 5, `Expected 5 total entries in global ledger, got ${allEntries.length}`);
+
+    const check = auditLedger.verifyIntegrity();
+    assert(check.valid === true, "Full ledger must maintain unbroken hash chain");
+  });
+
+  // 6. Concurrent execution isolation
+  await testCase("Concurrent captureRequestAuditEvents contexts remain strictly isolated", async () => {
+    auditLedger.reset();
+
+    const [reqA, reqB] = await Promise.all([
+      captureRequestAuditEvents(async () => {
+        await new Promise((r) => setTimeout(r, 10));
+        auditLedger.record("buyer_agent", "REQ_A_1", { source: "A" });
+        await new Promise((r) => setTimeout(r, 20));
+        auditLedger.record("buyer_agent", "REQ_A_2", { source: "A" });
+        return "A";
+      }),
+      captureRequestAuditEvents(async () => {
+        await new Promise((r) => setTimeout(r, 5));
+        auditLedger.record("seller_agent", "REQ_B_1", { source: "B" });
+        await new Promise((r) => setTimeout(r, 15));
+        auditLedger.record("seller_agent", "REQ_B_2", { source: "B" });
+        return "B";
+      }),
+    ]);
+
+    assert(reqA.events.length === 2, "Req A must have exactly 2 events");
+    assert(reqA.events.every((e) => e.payload.source === "A"), "Req A events must only belong to A");
+    assert(reqB.events.length === 2, "Req B must have exactly 2 events");
+    assert(reqB.events.every((e) => e.payload.source === "B"), "Req B events must only belong to B");
+
+    const check = auditLedger.verifyIntegrity();
+    assert(check.valid === true, "Interleaved events in ledger must still form valid hash chain");
   });
 
   console.log("\n=================================================");

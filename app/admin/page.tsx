@@ -20,6 +20,12 @@ import {
   AlertOctagon,
   FileSpreadsheet,
 } from "lucide-react";
+import {
+  getStoredAuditEvents,
+  getStoredSessions,
+  appendStoredAuditEvents,
+  saveStoredSessions,
+} from "@/lib/storage/browserStore";
 
 // Register AG Grid Community modules
 ModuleRegistry.registerModules([CommunityFeaturesModule, CsvExportModule, ClientSideRowModelModule]);
@@ -46,16 +52,20 @@ export default function AdminDashboardPage() {
       const negData = await negRes.json();
 
       if (auditData.entries) {
-        setAuditEntries(auditData.entries);
+        appendStoredAuditEvents(auditData.entries);
         setIntegrity(auditData.integrity || { valid: true });
       }
 
       if (negData.sessions) {
-        setSessions(negData.sessions);
+        saveStoredSessions(negData.sessions);
       }
     } catch (err) {
       console.error("Failed to fetch dashboard data:", err);
     } finally {
+      const storedEvents = getStoredAuditEvents();
+      const storedSessions = getStoredSessions();
+      setAuditEntries(storedEvents);
+      setSessions(storedSessions);
       setLoading(false);
     }
   };
@@ -184,6 +194,26 @@ export default function AdminDashboardPage() {
         width: 200,
         cellClass: "font-mono text-xs text-cyan-300",
         valueFormatter: (p) => p.value || "—",
+      },
+      {
+        field: "paypalCaptureStatus",
+        headerName: "Capture Status",
+        width: 150,
+        sortable: true,
+        filter: true,
+        cellRenderer: (p: any) => {
+          const val = p.value;
+          if (!val) return <span className="text-slate-500">—</span>;
+          let color = "bg-slate-700 text-slate-300";
+          if (val === "COMPLETED") color = "bg-emerald-500/20 text-emerald-300 border border-emerald-500/30";
+          if (val === "PENDING") color = "bg-amber-500/20 text-amber-300 border border-amber-500/30";
+          if (val === "PARTIALLY_REFUNDED") color = "bg-cyan-500/20 text-cyan-300 border border-cyan-500/30";
+          return (
+            <span className={`px-2 py-0.5 rounded text-[11px] font-bold uppercase ${color}`}>
+              {val}
+            </span>
+          );
+        },
       },
     ],
     []

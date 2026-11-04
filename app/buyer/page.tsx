@@ -18,6 +18,11 @@ import {
 import { SEEDED_PRODUCTS, MarketplaceProduct } from "@/lib/negotiation/catalog";
 import { BuyerPolicy } from "@/lib/policy/types";
 import { NegotiationSession, NegotiationTurnRecord } from "@/lib/negotiation/engine";
+import {
+  getStoredSessions,
+  saveStoredSession,
+  appendStoredAuditEvents,
+} from "@/lib/storage/browserStore";
 
 export default function BuyerPortalPage() {
   const [selectedProduct, setSelectedProduct] = useState<MarketplaceProduct>(SEEDED_PRODUCTS[0]);
@@ -30,9 +35,13 @@ export default function BuyerPortalPage() {
   const [loading, setLoading] = useState<boolean>(false);
   const [statusMessage, setStatusMessage] = useState<string>("");
   const [orderCaptured, setOrderCaptured] = useState<boolean>(false);
-  const [captureDetails, setCaptureDetails] = useState<{ orderId: string; captureId: string } | null>(null);
+  const [captureDetails, setCaptureDetails] = useState<{
+    orderId: string;
+    captureId: string;
+    status?: string;
+  } | null>(null);
 
-  // Initialize or fetch initial product from URL param if available
+  // Initialize or fetch initial product from URL param if available, and restore persisted session
   useEffect(() => {
     if (typeof window !== "undefined") {
       const urlParams = new URLSearchParams(window.location.search);
@@ -40,6 +49,44 @@ export default function BuyerPortalPage() {
       if (prodId) {
         const found = SEEDED_PRODUCTS.find((p) => p.id === prodId);
         if (found) setSelectedProduct(found);
+      }
+
+      // Restore latest session from browser-local storage
+      const stored = getStoredSessions();
+      if (stored.length > 0) {
+        const latest = stored[0];
+        setSession(latest);
+        if (latest.product) {
+          const matchProd = SEEDED_PRODUCTS.find((p) => p.id === latest.product.id);
+          if (matchProd) setSelectedProduct(matchProd);
+        }
+        if (latest.paypalCaptureId) {
+          setOrderCaptured(true);
+          setCaptureDetails({
+            orderId: latest.paypalOrderId || "",
+            captureId: latest.paypalCaptureId,
+            status: latest.paypalCaptureStatus || undefined,
+          });
+          const captureStatus = (latest.paypalCaptureStatus || "").toUpperCase();
+          const price = (latest.agreedPrice ?? 60).toFixed(2);
+          if (captureStatus === "COMPLETED") {
+            setStatusMessage(`Payment Successful! Your payment of $${price} has been captured.`);
+          } else if (captureStatus === "PENDING") {
+            setStatusMessage("Payment Processing – PayPal is still confirming your payment.");
+          } else {
+            setStatusMessage(
+              `Payment status: ${captureStatus || "Unknown"}. Please verify with PayPal.`
+            );
+          }
+        } else if (latest.status === "AGREED" || latest.status === "AWAITING_HUMAN_APPROVAL") {
+          setStatusMessage(`Agreement reached at $${latest.agreedPrice?.toFixed(2)}! Authorize via PayPal below.`);
+        } else if (latest.status === "COMPLETED") {
+          setStatusMessage("Negotiation deal completed (Demo Seed).");
+        } else if (latest.status === "REJECTED") {
+          setStatusMessage("Negotiation ended without agreement.");
+        } else if (latest.turns?.length) {
+          setStatusMessage(`Resumed session at Turn #${latest.turns.length}.`);
+        }
       }
     }
   }, []);
@@ -71,6 +118,10 @@ export default function BuyerPortalPage() {
       const data = await res.json();
       if (data.session) {
         setSession(data.session);
+        saveStoredSession(data.session);
+        if (data.events) {
+          appendStoredAuditEvents(data.events);
+        }
         setStatusMessage("Session initialized! Click 'Next Turn' or 'Auto-Negotiate'.");
       }
     } catch (err: any) {
@@ -88,10 +139,16 @@ export default function BuyerPortalPage() {
     try {
       const res = await fetch(`/api/negotiations/${session.id}/step`, {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session }),
       });
       const data = await res.json();
       if (data.session) {
         setSession(data.session);
+        saveStoredSession(data.session);
+        if (data.events) {
+          appendStoredAuditEvents(data.events);
+        }
         if (data.session.status === "AGREED" || data.session.status === "AWAITING_HUMAN_APPROVAL") {
           setStatusMessage(`Agreement reached at $${data.session.agreedPrice?.toFixed(2)}! Authorize via PayPal below.`);
         } else if (data.session.status === "REJECTED") {
@@ -117,11 +174,17 @@ export default function BuyerPortalPage() {
       while (currentSession.status === "INITIAL" || currentSession.status === "IN_PROGRESS") {
         const res = await fetch(`/api/negotiations/${currentSession.id}/step`, {
           method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session: currentSession }),
         });
         const data = await res.json();
         if (data.session) {
           currentSession = data.session;
           setSession(currentSession);
+          saveStoredSession(currentSession);
+          if (data.events) {
+            appendStoredAuditEvents(data.events);
+          }
         } else {
           break;
         }
@@ -136,8 +199,20 @@ export default function BuyerPortalPage() {
     }
   };
 
-  const isAgreed =
-    session && (session.status === "AGREED" || session.status === "AWAITING_HUMAN_APPROVAL");
+  const hasCapturedPayment = Boolean(orderCaptured || session?.paypalCaptureId);
+  const isAgreed = Boolean(
+    session && (session.status === "AGREED" || session.status === "AWAITING_HUMAN_APPROVAL")
+  );
+  const showSettlementPanel = Boolean(
+    session && (isAgreed || hasCapturedPayment || session.status === "COMPLETED")
+  );
+
+  const actualCaptureStatus = (
+    captureDetails?.status ||
+    session?.paypalCaptureStatus ||
+    ""
+  ).toUpperCase();
+  const formattedSettlementPrice = (session?.agreedPrice ?? 60).toFixed(2);
 
   const paypalClientId =
     process.env.NEXT_PUBLIC_PAYPAL_CLIENT_ID ||
@@ -445,29 +520,79 @@ export default function BuyerPortalPage() {
           </div>
 
           {/* Settlement / PayPal Approval Gate */}
-          {isAgreed && (
-            <div className="glass-panel-glow rounded-2xl p-6 space-y-5 border-emerald-500/40">
+          {showSettlementPanel && (
+            <div
+              className={`glass-panel-glow rounded-2xl p-6 space-y-5 ${
+                hasCapturedPayment
+                  ? actualCaptureStatus === "COMPLETED"
+                    ? "border-emerald-500/40"
+                    : actualCaptureStatus === "PENDING"
+                    ? "border-amber-500/40"
+                    : "border-white/10"
+                  : "border-emerald-500/40"
+              }`}
+            >
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-white/10 pb-4">
                 <div>
                   <div className="flex items-center gap-2">
-                    <CheckCircle2 className="w-5 h-5 text-emerald-400" />
-                    <h3 className="text-lg font-bold text-white">Mutual Agreement Reached!</h3>
+                    {hasCapturedPayment ? (
+                      actualCaptureStatus === "COMPLETED" ? (
+                        <CheckCircle2 className="w-5 h-5 text-emerald-400" />
+                      ) : actualCaptureStatus === "PENDING" ? (
+                        <AlertTriangle className="w-5 h-5 text-amber-400" />
+                      ) : (
+                        <AlertTriangle className="w-5 h-5 text-slate-400" />
+                      )
+                    ) : (
+                      <CheckCircle2 className="w-5 h-5 text-emerald-400" />
+                    )}
+                    <h3 className="text-lg font-bold text-white">
+                      {hasCapturedPayment
+                        ? actualCaptureStatus === "COMPLETED"
+                          ? "Payment Confirmed"
+                          : actualCaptureStatus === "PENDING"
+                          ? "Payment Processing"
+                          : "Payment Status Recorded"
+                        : "Mutual Agreement Reached!"}
+                    </h3>
                   </div>
                   <p className="text-xs text-slate-300 mt-0.5">
-                    Both agents settled within policy bounds. Authorize PayPal payment to capture the order.
+                    {hasCapturedPayment
+                      ? actualCaptureStatus === "COMPLETED"
+                        ? "Transaction settled and verified with PayPal Orders v2."
+                        : actualCaptureStatus === "PENDING"
+                        ? "PayPal is confirming your payment. Settlement is pending clearance."
+                        : "Transaction recorded. Please verify settlement status with PayPal."
+                      : "Both agents settled within policy bounds. Authorize PayPal payment to capture the order."}
                   </p>
                 </div>
 
-                <div className="text-right self-start sm:self-auto bg-emerald-500/10 px-4 py-2 rounded-xl border border-emerald-500/20">
-                  <span className="text-[10px] text-emerald-300 uppercase block font-semibold">Agreed Settlement</span>
-                  <span className="text-2xl font-black text-white">${session?.agreedPrice?.toFixed(2)}</span>
+                <div
+                  className={`text-right self-start sm:self-auto px-4 py-2 rounded-xl border ${
+                    hasCapturedPayment
+                      ? actualCaptureStatus === "COMPLETED"
+                        ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-300"
+                        : actualCaptureStatus === "PENDING"
+                        ? "bg-amber-500/10 border-amber-500/20 text-amber-300"
+                        : "bg-slate-800 border-white/10 text-slate-300"
+                      : "bg-emerald-500/10 border-emerald-500/20 text-emerald-300"
+                  }`}
+                >
+                  <span className="text-[10px] uppercase block font-semibold">
+                    {hasCapturedPayment
+                      ? actualCaptureStatus === "COMPLETED"
+                        ? "Captured Amount"
+                        : "Payment Amount"
+                      : "Agreed Settlement"}
+                  </span>
+                  <span className="text-2xl font-black text-white">${formattedSettlementPrice}</span>
                   <span className="text-[10px] text-slate-400 block line-through">
                     List: ${session?.product.listPrice.toFixed(2)}
                   </span>
                 </div>
               </div>
 
-              {!orderCaptured ? (
+              {!hasCapturedPayment ? (
                 <div className="space-y-4">
                   <div className="bg-slate-900/80 rounded-xl p-3.5 border border-white/10 text-xs text-slate-300 flex items-center gap-2.5">
                     <ShieldCheck className="w-5 h-5 text-cyan-400 shrink-0" />
@@ -488,38 +613,73 @@ export default function BuyerPortalPage() {
                       <PayPalButtons
                         style={{ layout: "vertical", shape: "rect", color: "gold" }}
                         createOrder={async () => {
-                          const agreedAmount = session.agreedPrice || 60.0;
+                          const agreedAmount = session?.agreedPrice || 60.0;
                           const res = await fetch("/api/orders/create", {
                             method: "POST",
                             headers: { "Content-Type": "application/json" },
                             body: JSON.stringify({
-                              sessionId: session.id,
+                              sessionId: session?.id,
                               amount: agreedAmount,
-                              description: `${session.product.title} (Negotiated Agreement)`,
+                              description: `${session?.product.title} (Negotiated Agreement)`,
+                              session,
                             }),
                           });
                           const data = await res.json();
+                          if (data.session) {
+                            setSession(data.session);
+                            saveStoredSession(data.session);
+                          }
+                          if (data.events) {
+                            appendStoredAuditEvents(data.events);
+                          }
                           if (!data.orderId) throw new Error(data.error || "Order creation failed");
                           return data.orderId;
                         }}
                         onApprove={async (data) => {
-                          const res = await fetch("/api/orders/capture", {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({
-                              sessionId: session.id,
-                              orderId: data.orderID,
-                            }),
-                          });
-                          const result = await res.json();
-                          if (result.success) {
-                            setOrderCaptured(true);
-                            setCaptureDetails({
-                              orderId: data.orderID,
-                              captureId: result.captureId,
+                          if (!session) return;
+                          setLoading(true);
+                          setStatusMessage("Capturing payment via PayPal Orders v2...");
+                          try {
+                            const res = await fetch("/api/orders/capture", {
+                              method: "POST",
+                              headers: { "Content-Type": "application/json" },
+                              body: JSON.stringify({
+                                sessionId: session.id,
+                                orderId: data.orderID,
+                                session,
+                              }),
                             });
-                          } else {
-                            setStatusMessage(`Payment capture failed: ${result.error || "Capture was not successful"}`);
+                            const result = await res.json();
+                            if (result.session) {
+                              setSession(result.session);
+                              saveStoredSession(result.session);
+                            }
+                            if (result.events) {
+                              appendStoredAuditEvents(result.events);
+                            }
+                            if (result.success) {
+                              setOrderCaptured(true);
+                              setCaptureDetails({
+                                orderId: data.orderID,
+                                captureId: result.captureId,
+                                status: result.status,
+                              });
+                              const price = (result.session?.agreedPrice ?? session.agreedPrice ?? 60).toFixed(2);
+                              if (result.status === "COMPLETED") {
+                                setStatusMessage(`Payment Successful! Your payment of $${price} has been captured.`);
+                              } else if (result.status === "PENDING") {
+                                setStatusMessage("Payment Processing – PayPal is still confirming your payment.");
+                              } else {
+                                setStatusMessage(`Payment captured with status: ${result.status}`);
+                              }
+                            } else {
+                              setStatusMessage(`Payment capture failed: ${result.error || "Capture was not successful"}`);
+                            }
+                          } catch (err: any) {
+                            console.error("[PayPal Capture Error]", err);
+                            setStatusMessage(`Payment capture error: ${err.message || "Failed to communicate with capture API"}`);
+                          } finally {
+                            setLoading(false);
                           }
                         }}
                         onError={(err) => {
@@ -534,16 +694,52 @@ export default function BuyerPortalPage() {
                   </div>
                 </div>
               ) : (
-                /* Payment Success Receipt */
-                <div className="bg-emerald-950/40 border border-emerald-500/40 rounded-xl p-5 space-y-4">
+                /* Payment Confirmation Receipt */
+                <div
+                  className={`rounded-xl p-5 space-y-4 border ${
+                    actualCaptureStatus === "PENDING"
+                      ? "bg-amber-950/40 border-amber-500/40"
+                      : actualCaptureStatus === "COMPLETED"
+                      ? "bg-emerald-950/40 border-emerald-500/40"
+                      : "bg-slate-900 border-white/10"
+                  }`}
+                >
                   <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 rounded-xl bg-emerald-500/20 flex items-center justify-center text-emerald-400">
-                      <CheckCircle2 className="w-6 h-6" />
+                    <div
+                      className={`w-10 h-10 rounded-xl flex items-center justify-center ${
+                        actualCaptureStatus === "PENDING"
+                          ? "bg-amber-500/20 text-amber-400"
+                          : actualCaptureStatus === "COMPLETED"
+                          ? "bg-emerald-500/20 text-emerald-400"
+                          : "bg-slate-800 text-slate-300"
+                      }`}
+                    >
+                      {actualCaptureStatus === "PENDING" ? (
+                        <AlertTriangle className="w-6 h-6" />
+                      ) : actualCaptureStatus === "COMPLETED" ? (
+                        <CheckCircle2 className="w-6 h-6" />
+                      ) : (
+                        <AlertTriangle className="w-6 h-6" />
+                      )}
                     </div>
                     <div>
-                      <h4 className="text-base font-bold text-white">Payment Captured Successfully!</h4>
-                      <p className="text-xs text-emerald-300 font-mono">
-                        PayPal Orders v2 Capture Status: COMPLETED
+                      <h4 className="text-base font-bold text-white">
+                        {actualCaptureStatus === "PENDING"
+                          ? "Payment Processing – PayPal is still confirming your payment."
+                          : actualCaptureStatus === "COMPLETED"
+                          ? `Payment Successful! Your payment of $${formattedSettlementPrice} has been captured.`
+                          : `Payment Status: ${actualCaptureStatus || "RECORDED"}`}
+                      </h4>
+                      <p
+                        className={`text-xs font-mono ${
+                          actualCaptureStatus === "PENDING"
+                            ? "text-amber-300"
+                            : actualCaptureStatus === "COMPLETED"
+                            ? "text-emerald-300"
+                            : "text-slate-400"
+                        }`}
+                      >
+                        PayPal Orders v2 Capture Status: {actualCaptureStatus || "UNKNOWN"}
                       </p>
                     </div>
                   </div>
@@ -551,11 +747,15 @@ export default function BuyerPortalPage() {
                   <div className="grid grid-cols-2 gap-3 bg-slate-900/60 p-3 rounded-lg border border-white/5 text-xs font-mono">
                     <div>
                       <span className="text-slate-400 block text-[10px]">PAYPAL ORDER ID:</span>
-                      <span className="text-white font-bold">{captureDetails?.orderId}</span>
+                      <span className="text-white font-bold">
+                        {captureDetails?.orderId || session?.paypalOrderId || "—"}
+                      </span>
                     </div>
                     <div>
                       <span className="text-slate-400 block text-[10px]">PAYPAL CAPTURE ID:</span>
-                      <span className="text-cyan-400 font-bold">{captureDetails?.captureId}</span>
+                      <span className="text-cyan-400 font-bold">
+                        {captureDetails?.captureId || session?.paypalCaptureId || "—"}
+                      </span>
                     </div>
                   </div>
 

@@ -1,12 +1,17 @@
 import { NextResponse } from "next/server";
 import { NegotiationManager } from "@/lib/negotiation/engine";
 import { getOrder } from "@/lib/paypal/orders";
-import { auditLedger } from "@/lib/audit/ledger";
+import { auditLedger, captureRequestAuditEvents } from "@/lib/audit/ledger";
 
 export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
-    const { orderId } = body;
+    const { orderId, session: clientSession } = body;
+
+    // If client supplied a session snapshot, safely restore it through validated monotonic restoration
+    if (clientSession) {
+      NegotiationManager.restoreSession(clientSession);
+    }
 
     // Resolve target order ID from request or active sessions with genuine PayPal orders
     let targetOrderId = typeof orderId === "string" && orderId.trim() ? orderId.trim() : null;
@@ -37,23 +42,29 @@ export async function POST(req: Request) {
         synced: false,
         message:
           "This demo deal has no real PayPal order to sync. Complete checkout in the Buyer Portal to create and sync a live PayPal Sandbox order.",
+        events: [],
       });
     }
 
-    // Call live PayPal sandbox with genuine order ID
-    const liveOrder = await getOrder(targetOrderId);
+    // Call live PayPal sandbox with genuine order ID within request-scoped audit context
+    const { result: liveOrder, events } = await captureRequestAuditEvents(async () => {
+      const order = await getOrder(targetOrderId);
 
-    auditLedger.record("paypal_api", "ONE_SHOT_SANDBOX_SYNC", {
-      orderId: targetOrderId,
-      status: liveOrder.status,
-      grossAmount: liveOrder.purchase_units?.[0]?.amount?.value,
-      timestamp: new Date().toISOString(),
+      auditLedger.record("paypal_api", "ONE_SHOT_SANDBOX_SYNC", {
+        orderId: targetOrderId,
+        status: order.status,
+        grossAmount: order.purchase_units?.[0]?.amount?.value,
+        timestamp: new Date().toISOString(),
+      });
+
+      return order;
     });
 
     return NextResponse.json({
       success: true,
       order: liveOrder,
       message: `Successfully synchronized order ${targetOrderId} directly from PayPal Sandbox.`,
+      events,
     });
   } catch (err: any) {
     console.error("[Sync API] Error in sandbox sync:", err);

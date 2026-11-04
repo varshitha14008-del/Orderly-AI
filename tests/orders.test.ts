@@ -8,6 +8,8 @@ import { POST as captureOrderRoute } from "../app/api/orders/capture/route";
 import { POST as refundRoute } from "../app/api/disputes/refund/route";
 import { POST as seedRoute } from "../app/api/demo/seed/route";
 import { POST as syncRoute } from "../app/api/demo/sync/route";
+import { POST as createNegotiationRoute } from "../app/api/negotiations/route";
+import { POST as stepRoute } from "../app/api/negotiations/[id]/step/route";
 import { refundCapture } from "../lib/paypal/payments";
 import { NegotiationManager } from "../lib/negotiation/engine";
 import { auditLedger } from "../lib/audit/ledger";
@@ -56,6 +58,7 @@ async function runOrdersApiTests() {
   let paypalGetCaptureCallCount = 0;
   let paypalGetOrderCallCount = 0;
   let mockRefundResponseStatus: "COMPLETED" | "PENDING" | "FAILED" = "COMPLETED";
+  let mockOrderCaptureStatus: "COMPLETED" | "PENDING" = "COMPLETED";
 
   const mockCaptures = new Map<string, MockCaptureState>();
 
@@ -65,6 +68,7 @@ async function runOrdersApiTests() {
     paypalGetCaptureCallCount = 0;
     paypalGetOrderCallCount = 0;
     mockRefundResponseStatus = "COMPLETED";
+    mockOrderCaptureStatus = "COMPLETED";
     mockCaptures.clear();
 
     globalThis.fetch = async (url: any, init?: any): Promise<Response> => {
@@ -136,7 +140,7 @@ async function runOrdersApiTests() {
                   captures: [
                     {
                       id: "CAP-REAL-PAYPAL-443322",
-                      status: "COMPLETED",
+                      status: mockOrderCaptureStatus,
                       amount: { currency_code: "USD", value: "60.00" },
                     },
                   ],
@@ -339,15 +343,16 @@ async function runOrdersApiTests() {
       assert(data.captureId === "CAP-REAL-PAYPAL-443322", "Capture ID must match PayPal response");
       assert(data.status === "COMPLETED", "Status must be COMPLETED");
 
-      // Verify session updated to COMPLETED
+      // Verify session updated to COMPLETED with actual capture status
       const updatedSession = NegotiationManager.getSession(session.id);
       assert(updatedSession?.status === "COMPLETED", "Session status must be COMPLETED");
       assert(updatedSession?.paypalCaptureId === "CAP-REAL-PAYPAL-443322", "Capture ID must be attached");
+      assert(updatedSession?.paypalCaptureStatus === "COMPLETED", "Capture status must be COMPLETED");
 
       // Verify audit record
       const auditEntries = auditLedger.getEntries();
-      const captureAudit = auditEntries.find((e) => e.payload?.captureId === "CAP-REAL-PAYPAL-443322");
-      assert(captureAudit !== undefined, "Audit ledger must record capture");
+      const captureAudit = auditEntries.find((e) => e.type === "PAYMENT_CAPTURE_COMPLETED" && e.payload?.captureId === "CAP-REAL-PAYPAL-443322");
+      assert(captureAudit !== undefined, "Audit ledger must record PAYMENT_CAPTURE_COMPLETED");
     });
 
     // -------------------------------------------------------------
@@ -742,6 +747,7 @@ async function runOrdersApiTests() {
       assert(data.session.status === "COMPLETED", "Session status must be COMPLETED");
       assert(data.session.agreedPrice === 48.0, "Session agreed price must be 48.0");
       assert(data.session.turns.length === 4, "Must preserve the 4 negotiated turns");
+      assert(data.session.version === 2, `Expected session version to be 2, got ${data.session.version}`);
     });
 
     // -------------------------------------------------------------
@@ -856,6 +862,300 @@ async function runOrdersApiTests() {
       assert(data.error.includes("simulated demo placeholder"), "Error must state captureId is a simulated demo placeholder");
       assert(paypalGetCaptureCallCount === getCaptureCallsBefore, "getCapture must NOT be called for demo placeholder");
       assert(paypalRefundApiCallCount === refundCallsBefore, "refundCapture must NOT be called for demo placeholder");
+    });
+
+    // -------------------------------------------------------------
+    // Test 22: Capture Order - PENDING capture status extracted, stored, and audited accurately
+    // -------------------------------------------------------------
+    await testCase("POST /api/orders/capture: Extracts PENDING capture status and records PAYMENT_CAPTURE_PENDING", async () => {
+      NegotiationManager.resetAll();
+      setupMockPayPalFetch();
+      mockOrderCaptureStatus = "PENDING";
+
+      const session = NegotiationManager.createSession("prod-kb-01");
+      session.agreedPrice = 60.0;
+      session.status = "AGREED";
+      session.paypalOrderId = "ORDER-MOCK-PENDING-99";
+
+      const req = new Request("http://localhost:3000/api/orders/capture", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: session.id,
+          orderId: "ORDER-MOCK-PENDING-99",
+        }),
+      });
+
+      const res = await captureOrderRoute(req);
+      assert(res.status === 200, `Expected status 200, got ${res.status}`);
+      const data = await res.json();
+
+      assert(data.success === true, "Expected success true");
+      assert(data.status === "PENDING", "Response status must reflect actual capture status PENDING");
+      assert(data.captureId === "CAP-REAL-PAYPAL-443322", "Capture ID must match PayPal response");
+
+      // Verify session preserves PENDING capture status while marking negotiation COMPLETED
+      const updatedSession = NegotiationManager.getSession(session.id);
+      assert(updatedSession?.status === "COMPLETED", "Negotiation session status must be COMPLETED");
+      assert(updatedSession?.paypalCaptureStatus === "PENDING", "Session paypalCaptureStatus must be PENDING");
+      assert(updatedSession?.paypalCaptureId === "CAP-REAL-PAYPAL-443322", "Capture ID must be attached");
+
+      // Verify audit record is PAYMENT_CAPTURE_PENDING and NOT PAYMENT_CAPTURE_COMPLETED
+      const auditEntries = auditLedger.getEntries();
+      const completedAudit = auditEntries.find((e) => e.type === "PAYMENT_CAPTURE_COMPLETED");
+      assert(completedAudit === undefined, "Audit ledger must NOT record PAYMENT_CAPTURE_COMPLETED for pending capture");
+
+      const pendingAudit = auditEntries.find((e) => e.type === "PAYMENT_CAPTURE_PENDING" && e.payload?.captureId === "CAP-REAL-PAYPAL-443322");
+      assert(pendingAudit !== undefined, "Audit ledger must record PAYMENT_CAPTURE_PENDING");
+      assert(pendingAudit.payload.status === "PENDING", "Audit payload status must be PENDING");
+    });
+
+    // -------------------------------------------------------------
+    // Test 23: POST /api/negotiations returns events and session at version 1
+    // -------------------------------------------------------------
+    await testCase("POST /api/negotiations: Returns events array with NEGOTIATION_INITIALIZED and session at version 1", async () => {
+      NegotiationManager.resetAll();
+
+      const req = new Request("http://localhost:3000/api/negotiations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          productId: "prod-kb-01",
+        }),
+      });
+
+      const res = await createNegotiationRoute(req);
+      assert(res.status === 200, `Expected status 200, got ${res.status}`);
+      const data = await res.json();
+
+      assert(data.success === true, "Expected success true");
+      assert(data.session !== undefined, "Expected session in response");
+      assert(data.session.version === 1, `Expected session version 1, got ${data.session.version}`);
+      assert(Array.isArray(data.events), "Expected events to be an array");
+      assert(data.events.length === 1, `Expected exactly 1 event, got ${data.events.length}`);
+      assert(data.events[0].type === "NEGOTIATION_INITIALIZED", "Expected NEGOTIATION_INITIALIZED event");
+      assert(data.events[0].payload?.sessionId === data.session.id, "Event payload sessionId must match created session ID");
+    });
+
+    // -------------------------------------------------------------
+    // Test 24: POST /api/negotiations/[id]/step restores snapshot, executes turn, increments version
+    // -------------------------------------------------------------
+    await testCase("POST /api/negotiations/[id]/step: Restores session snapshot, executes turn, increments version, and returns genuine turn events", async () => {
+      NegotiationManager.resetAll();
+      const initial = NegotiationManager.createSession("prod-kb-01");
+      const snapshot = JSON.parse(JSON.stringify(initial));
+
+      // Wipe server memory to simulate cold container
+      NegotiationManager.resetAll();
+      assert(NegotiationManager.getSession(snapshot.id) === undefined, "Server memory must be empty");
+
+      const req = new Request(`http://localhost:3000/api/negotiations/${snapshot.id}/step`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session: snapshot }),
+      });
+
+      const res = await stepRoute(req, { params: { id: snapshot.id } });
+      assert(res.status === 200, `Expected status 200, got ${res.status}`);
+      const data = await res.json();
+
+      assert(data.success === true, "Expected success true");
+      assert(data.session.id === snapshot.id, "Session ID must match");
+      assert(data.session.version === 2, `Expected session version to increment to 2, got ${data.session.version}`);
+      assert(data.session.turns.length === 1, "Expected 1 turn completed");
+      assert(Array.isArray(data.events), "Expected events array");
+      assert(data.events.length > 0, "Expected at least 1 turn event captured");
+      assert(data.events.some((e: any) => e.type.includes("PROPOSAL")), "Expected agent proposal event in captured events");
+
+      // Verify server in-memory session is also updated
+      const serverSession = NegotiationManager.getSession(snapshot.id);
+      assert(serverSession?.version === 2, "Server session version must be 2");
+      assert(serverSession?.turns.length === 1, "Server session must have 1 turn");
+    });
+
+    // -------------------------------------------------------------
+    // Test 25: POST /api/negotiations/[id]/step rejects stale snapshot with older version (HTTP 400)
+    // -------------------------------------------------------------
+    await testCase("POST /api/negotiations/[id]/step: Rejects stale snapshot with older version (HTTP 400)", async () => {
+      NegotiationManager.resetAll();
+      const session = NegotiationManager.createSession("prod-kb-01");
+      // Advance session on server to version 3
+      await NegotiationManager.step(session.id); // v2
+      await NegotiationManager.step(session.id); // v3
+      assert(NegotiationManager.getSession(session.id)!.version === 3, "Server session should be at version 3");
+
+      // Stale snapshot with version 1
+      const staleSnapshot = {
+        ...JSON.parse(JSON.stringify(session)),
+        version: 1,
+        turns: [],
+      };
+
+      const req = new Request(`http://localhost:3000/api/negotiations/${session.id}/step`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session: staleSnapshot }),
+      });
+
+      const res = await stepRoute(req, { params: { id: session.id } });
+      assert(res.status === 400, `Expected status 400 for stale snapshot, got ${res.status}`);
+      const data = await res.json();
+      assert(data.success === false, "Expected success false");
+      assert(data.error.includes("Stale session snapshot rejected"), "Error should indicate stale snapshot rejection");
+      // Confirm server session is untouched at version 3
+      assert(NegotiationManager.getSession(session.id)!.version === 3, "Server session must remain at version 3");
+    });
+
+    // -------------------------------------------------------------
+    // Test 26: POST /api/orders/create restores session from snapshot, attaches order, and returns genuine events
+    // -------------------------------------------------------------
+    await testCase("POST /api/orders/create: Restores session from snapshot, attaches order, and returns genuine events and updated session", async () => {
+      NegotiationManager.resetAll();
+      setupMockPayPalFetch();
+
+      const session = NegotiationManager.createSession("prod-kb-01");
+      session.agreedPrice = 60.0;
+      session.status = "AGREED";
+      session.version = 2;
+      const snapshot = JSON.parse(JSON.stringify(session));
+
+      // Wipe server memory
+      NegotiationManager.resetAll();
+      assert(NegotiationManager.getSession(snapshot.id) === undefined, "Server memory must be empty");
+
+      const req = new Request("http://localhost:3000/api/orders/create", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: snapshot.id,
+          session: snapshot,
+        }),
+      });
+
+      const res = await createOrderRoute(req);
+      assert(res.status === 200, `Expected status 200, got ${res.status}`);
+      const data = await res.json();
+
+      assert(data.success === true, "Expected success true");
+      assert(data.orderId === "ORDER-MOCK-998877", "Expected orderId");
+      assert(data.session !== undefined, "Expected updated session in response");
+      assert(data.session.paypalOrderId === "ORDER-MOCK-998877", "Session must have paypalOrderId attached");
+      assert(data.session.version === 3, `Session version should increment from 2 to 3, got ${data.session.version}`);
+      assert(Array.isArray(data.events), "Expected events array");
+      assert(data.events.some((e: any) => e.type === "PAYPAL_ORDER_CREATED"), "Expected PAYPAL_ORDER_CREATED event");
+      assert(data.events.some((e: any) => e.type === "ORDER_ATTACHED_TO_SESSION"), "Expected ORDER_ATTACHED_TO_SESSION event");
+
+      // Verify server session
+      const serverSession = NegotiationManager.getSession(snapshot.id);
+      assert(serverSession?.paypalOrderId === "ORDER-MOCK-998877", "Server session must have paypalOrderId");
+      assert(serverSession?.version === 3, "Server session version must be 3");
+    });
+
+    // -------------------------------------------------------------
+    // Test 27: POST /api/orders/capture restores session, attaches capture, and returns genuine events
+    // -------------------------------------------------------------
+    await testCase("POST /api/orders/capture: Restores session, attaches capture, and returns genuine events and updated session", async () => {
+      NegotiationManager.resetAll();
+      setupMockPayPalFetch();
+      mockOrderCaptureStatus = "COMPLETED";
+
+      const session = NegotiationManager.createSession("prod-kb-01");
+      session.agreedPrice = 60.0;
+      session.status = "AGREED";
+      session.paypalOrderId = "ORDER-MOCK-998877";
+      session.version = 3;
+      const snapshot = JSON.parse(JSON.stringify(session));
+
+      // Wipe server memory
+      NegotiationManager.resetAll();
+      assert(NegotiationManager.getSession(snapshot.id) === undefined, "Server memory must be empty");
+
+      const req = new Request("http://localhost:3000/api/orders/capture", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: snapshot.id,
+          orderId: "ORDER-MOCK-998877",
+          session: snapshot,
+        }),
+      });
+
+      const res = await captureOrderRoute(req);
+      assert(res.status === 200, `Expected status 200, got ${res.status}`);
+      const data = await res.json();
+
+      assert(data.success === true, "Expected success true");
+      assert(data.captureId === "CAP-REAL-PAYPAL-443322", "Expected capture ID");
+      assert(data.status === "COMPLETED", "Expected status COMPLETED");
+      assert(data.session !== undefined, "Expected updated session in response");
+      assert(data.session.status === "COMPLETED", "Session negotiation status must be COMPLETED");
+      assert(data.session.paypalCaptureStatus === "COMPLETED", "Session paypalCaptureStatus must be COMPLETED");
+      assert(data.session.paypalCaptureId === "CAP-REAL-PAYPAL-443322", "Session paypalCaptureId must be attached");
+      assert(data.session.version === 4, `Session version should increment from 3 to 4, got ${data.session.version}`);
+      assert(Array.isArray(data.events), "Expected events array");
+      assert(data.events.some((e: any) => e.type === "PAYMENT_CAPTURE_COMPLETED"), "Expected PAYMENT_CAPTURE_COMPLETED event");
+      assert(data.events.some((e: any) => e.type === "CAPTURE_ATTACHED_TO_SESSION"), "Expected CAPTURE_ATTACHED_TO_SESSION event");
+
+      // Verify server session
+      const serverSession = NegotiationManager.getSession(snapshot.id);
+      assert(serverSession?.paypalCaptureId === "CAP-REAL-PAYPAL-443322", "Server session must have capture ID");
+      assert(serverSession?.paypalCaptureStatus === "COMPLETED", "Server session capture status must be COMPLETED");
+      assert(serverSession?.version === 4, "Server session version must be 4");
+    });
+
+    // -------------------------------------------------------------
+    // Test 28: POST /api/disputes/refund returns genuine audit events on contest and refund
+    // -------------------------------------------------------------
+    await testCase("POST /api/disputes/refund: Contest and refund responses return genuine audit events", async () => {
+      // 1. Contest ruling
+      const contestReq = new Request("http://localhost:3000/api/disputes/refund", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: "neg-contest-audit-01",
+          captureId: "CAP-CONTEST-AUDIT-99",
+          amount: 0,
+          decision: "contest",
+          note: "Merchant policy dispute contest.",
+        }),
+      });
+
+      const contestRes = await refundRoute(contestReq);
+      assert(contestRes.status === 200, `Expected status 200 for contest, got ${contestRes.status}`);
+      const contestData = await contestRes.json();
+      assert(contestData.success === true, "Expected contest success");
+      assert(contestData.decision === "contest", "Expected decision contest");
+      assert(Array.isArray(contestData.events), "Expected events array in contest response");
+      assert(contestData.events.length === 1, "Expected exactly 1 contest event");
+      assert(contestData.events[0].type === "DISPUTE_CONTEST_RULING_RECORDED", "Expected DISPUTE_CONTEST_RULING_RECORDED");
+
+      // 2. Refund execution
+      mockCaptures.set("CAP-REFUND-AUDIT-88", {
+        id: "CAP-REFUND-AUDIT-88",
+        status: "COMPLETED",
+        amount: { value: "50.00", currency_code: "USD" },
+        totalRefunded: 0,
+      });
+
+      const refundReq = new Request("http://localhost:3000/api/disputes/refund", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: "neg-refund-audit-02",
+          captureId: "CAP-REFUND-AUDIT-88",
+          amount: 25.0,
+          decision: "partial_refund",
+          note: "Damage compensation",
+        }),
+      });
+
+      const refundRes = await refundRoute(refundReq);
+      assert(refundRes.status === 200, `Expected status 200 for refund, got ${refundRes.status}`);
+      const refundData = await refundRes.json();
+      assert(refundData.success === true, "Expected refund success");
+      assert(refundData.refundIssued === true, "Expected refundIssued true");
+      assert(Array.isArray(refundData.events), "Expected events array in refund response");
+      assert(refundData.events.some((e: any) => e.type === "REFUND_APPROVED_AND_EXECUTED"), "Expected REFUND_APPROVED_AND_EXECUTED event");
     });
 
   } finally {

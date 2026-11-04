@@ -15,6 +15,12 @@ import {
   LayoutDashboard,
   Zap,
 } from "lucide-react";
+import {
+  saveStoredSession,
+  appendStoredAuditEvents,
+  clearBrowserStorage,
+  getStoredSessions,
+} from "@/lib/storage/browserStore";
 
 export default function DemoControlPage() {
   const [loading, setLoading] = useState<boolean>(false);
@@ -26,6 +32,12 @@ export default function DemoControlPage() {
     try {
       const res = await fetch("/api/demo/seed", { method: "POST" });
       const data = await res.json();
+      if (data.session) {
+        saveStoredSession(data.session);
+      }
+      if (data.events) {
+        appendStoredAuditEvents(data.events);
+      }
       setActionOutput(
         `✓ Seed Successful! Created Session ${data.session.id} for ${data.session.product.title} (Settled at $${data.session.agreedPrice.toFixed(2)}).`
       );
@@ -43,6 +55,7 @@ export default function DemoControlPage() {
     try {
       const res = await fetch("/api/demo/reset", { method: "POST" });
       const data = await res.json();
+      clearBrowserStorage();
       setActionOutput(`✓ ${data.message}`);
     } catch (err: any) {
       setActionOutput(`Reset error: ${err.message}`);
@@ -55,12 +68,21 @@ export default function DemoControlPage() {
     setLoading(true);
     setActionOutput("Pulling one-shot live transaction status from PayPal Sandbox API...");
     try {
+      const stored = getStoredSessions();
+      const activeSession = stored.length > 0 ? stored[0] : undefined;
+
       const res = await fetch("/api/demo/sync", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
+        body: JSON.stringify({
+          session: activeSession,
+          orderId: activeSession?.paypalOrderId || undefined,
+        }),
       });
       const data = await res.json();
+      if (data.events) {
+        appendStoredAuditEvents(data.events);
+      }
       if (data.order) {
         setActionOutput(
           `✓ PayPal Sandbox Synced! Order ${data.order.id} is ${data.order.status} for ${data.order.purchase_units?.[0]?.amount?.value} ${data.order.purchase_units?.[0]?.amount?.currency_code}. Recorded in audit log.`
@@ -104,7 +126,6 @@ export default function DemoControlPage() {
             <h2 className="text-base font-bold text-white">Seed Golden Demo Deal</h2>
             <p className="text-xs text-slate-400 leading-relaxed">
               Populates a realistic multi-round negotiated keyboard deal for rapid evaluation and testing.
-
             </p>
           </div>
 

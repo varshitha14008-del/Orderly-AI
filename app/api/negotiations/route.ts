@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { NegotiationManager } from "@/lib/negotiation/engine";
 import { SEEDED_PRODUCTS } from "@/lib/negotiation/catalog";
+import { captureRequestAuditEvents } from "@/lib/audit/ledger";
 
 export async function GET() {
   const sessions = NegotiationManager.getAllSessions();
@@ -15,11 +16,14 @@ export async function POST(req: Request) {
     const body = await req.json();
     const { productId, buyerPolicy, merchantPolicy } = body;
 
-    const session = NegotiationManager.createSession(productId, buyerPolicy, merchantPolicy);
+    const { result: session, events } = await captureRequestAuditEvents(() =>
+      NegotiationManager.createSession(productId, buyerPolicy, merchantPolicy)
+    );
 
     return NextResponse.json({
       success: true,
       session,
+      events,
     });
   } catch (err: any) {
     return NextResponse.json(

@@ -4,6 +4,7 @@
  */
 
 import crypto from "crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 export type AuditActor =
   | "buyer_agent"
@@ -51,6 +52,8 @@ export function computeEntryHash(
   const data = `${prevHash}:${timestamp}:${actor}:${type}:${canonicalPayload}`;
   return crypto.createHash("sha256").update(data).digest("hex");
 }
+
+const auditAsyncStorage = new AsyncLocalStorage<AuditEntry[]>();
 
 class AuditLedger {
   private chain: AuditEntry[] = [];
@@ -103,6 +106,11 @@ class AuditLedger {
     };
 
     this.chain.push(entry);
+
+    const store = auditAsyncStorage.getStore();
+    if (store) {
+      store.push(entry);
+    }
     return entry;
   }
 
@@ -169,3 +177,15 @@ export const auditLedger: AuditLedger =
   globalForAudit.__orderlyAuditLedger ?? new AuditLedger();
 
 globalForAudit.__orderlyAuditLedger = auditLedger;
+
+/**
+ * Executes an action within an isolated request-scoped audit context.
+ * Captures all AuditEntry items recorded strictly within this async execution context.
+ */
+export async function captureRequestAuditEvents<T>(
+  action: () => Promise<T> | T
+): Promise<{ result: T; events: AuditEntry[] }> {
+  const collector: AuditEntry[] = [];
+  const result = await auditAsyncStorage.run(collector, action);
+  return { result, events: collector };
+}
