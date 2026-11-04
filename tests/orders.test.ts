@@ -6,6 +6,8 @@
 import { POST as createOrderRoute } from "../app/api/orders/create/route";
 import { POST as captureOrderRoute } from "../app/api/orders/capture/route";
 import { POST as refundRoute } from "../app/api/disputes/refund/route";
+import { POST as seedRoute } from "../app/api/demo/seed/route";
+import { POST as syncRoute } from "../app/api/demo/sync/route";
 import { refundCapture } from "../lib/paypal/payments";
 import { NegotiationManager } from "../lib/negotiation/engine";
 import { auditLedger } from "../lib/audit/ledger";
@@ -52,6 +54,7 @@ async function runOrdersApiTests() {
 
   let paypalRefundApiCallCount = 0;
   let paypalGetCaptureCallCount = 0;
+  let paypalGetOrderCallCount = 0;
   let mockRefundResponseStatus: "COMPLETED" | "PENDING" | "FAILED" = "COMPLETED";
 
   const mockCaptures = new Map<string, MockCaptureState>();
@@ -60,6 +63,7 @@ async function runOrdersApiTests() {
     invalidateCachedToken();
     paypalRefundApiCallCount = 0;
     paypalGetCaptureCallCount = 0;
+    paypalGetOrderCallCount = 0;
     mockRefundResponseStatus = "COMPLETED";
     mockCaptures.clear();
 
@@ -99,6 +103,24 @@ async function runOrdersApiTests() {
             ],
           }),
           { status: 201, headers: { "Content-Type": "application/json" } }
+        );
+      }
+
+      // Mock Orders v2 Get Order (GET /v2/checkout/orders/{id})
+      if (urlStr.includes("/v2/checkout/orders/") && (!init?.method || init?.method === "GET")) {
+        paypalGetOrderCallCount++;
+        const parts = urlStr.split("/v2/checkout/orders/")[1].split("/")[0].split("?")[0];
+        return new Response(
+          JSON.stringify({
+            id: parts,
+            status: "COMPLETED",
+            purchase_units: [
+              {
+                amount: { currency_code: "USD", value: "48.00" },
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
         );
       }
 
@@ -702,6 +724,138 @@ async function runOrdersApiTests() {
         threwNegative = e.message.includes("greater than zero");
       }
       assert(threwNegative === true, "refundCapture must throw on negative amount");
+    });
+
+    // -------------------------------------------------------------
+    // Test 16: Demo seed does not attach fabricated PayPal IDs
+    // -------------------------------------------------------------
+    await testCase("POST /api/demo/seed: Does not attach fabricated PayPal order or capture IDs", async () => {
+      NegotiationManager.resetAll();
+      setupMockPayPalFetch();
+
+      const res = await seedRoute();
+      assert(res.status === 200, `Expected status 200, got ${res.status}`);
+      const data = await res.json();
+      assert(data.success === true, "Demo seed should succeed");
+      assert(data.session.paypalOrderId === null, `Expected paypalOrderId to be null, got ${data.session.paypalOrderId}`);
+      assert(data.session.paypalCaptureId === null, `Expected paypalCaptureId to be null, got ${data.session.paypalCaptureId}`);
+      assert(data.session.status === "COMPLETED", "Session status must be COMPLETED");
+      assert(data.session.agreedPrice === 48.0, "Session agreed price must be 48.0");
+      assert(data.session.turns.length === 4, "Must preserve the 4 negotiated turns");
+    });
+
+    // -------------------------------------------------------------
+    // Test 17: Demo seed does not claim a real capture occurred
+    // -------------------------------------------------------------
+    await testCase("POST /api/demo/seed: Does not record PAYMENT_CAPTURE_COMPLETED in audit ledger", async () => {
+      NegotiationManager.resetAll();
+      setupMockPayPalFetch();
+
+      await seedRoute();
+      const entries = auditLedger.getEntries();
+      const captureEntry = entries.find((e) => e.type === "PAYMENT_CAPTURE_COMPLETED");
+      assert(captureEntry === undefined, "Audit ledger must NOT contain PAYMENT_CAPTURE_COMPLETED for uncaptured demo");
+
+      const seedEntry = entries.find((e) => e.type === "DEMO_COMPLETED_DEAL_SEEDED");
+      assert(seedEntry !== undefined, "Audit ledger must record clearly labeled DEMO_COMPLETED_DEAL_SEEDED");
+      assert(seedEntry.payload.hasRealPayPalPayment === false, "Must explicitly mark hasRealPayPalPayment as false");
+    });
+
+    // -------------------------------------------------------------
+    // Test 18: Sync without a real PayPal order ID does not call PayPal
+    // -------------------------------------------------------------
+    await testCase("POST /api/demo/sync: Empty body without real PayPal order returns message and does NOT call PayPal", async () => {
+      NegotiationManager.resetAll();
+      setupMockPayPalFetch();
+
+      // Seed session without PayPal IDs
+      await seedRoute();
+
+      const callCountBefore = paypalGetOrderCallCount;
+      const req = new Request("http://localhost:3000/api/demo/sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+
+      const res = await syncRoute(req);
+      assert(res.status === 200, `Expected status 200, got ${res.status}`);
+      const data = await res.json();
+      assert(data.success === false, "Must return success=false when no genuine order exists");
+      assert(data.message.includes("no real PayPal order to sync"), "Message must explain that no real PayPal order exists");
+      assert(paypalGetOrderCallCount === callCountBefore, "PayPal API must NOT be called when no genuine order exists");
+    });
+
+    // -------------------------------------------------------------
+    // Test 19: Sync with expired/demo placeholder does not call PayPal
+    // -------------------------------------------------------------
+    await testCase("POST /api/demo/sync: Expired demo placeholder 49A309481M497412U is blocked from calling PayPal", async () => {
+      setupMockPayPalFetch();
+
+      const callCountBefore = paypalGetOrderCallCount;
+      const req = new Request("http://localhost:3000/api/demo/sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ orderId: "49A309481M497412U" }),
+      });
+
+      const res = await syncRoute(req);
+      const data = await res.json();
+      assert(data.success === false, "Must return success=false for demo placeholder order ID");
+      assert(paypalGetOrderCallCount === callCountBefore, "PayPal API must NOT be called for demo placeholder");
+    });
+
+    // -------------------------------------------------------------
+    // Test 20: Sync with genuine PayPal order calls PayPal and records sync
+    // -------------------------------------------------------------
+    await testCase("POST /api/demo/sync: Genuine PayPal order ID calls PayPal and records audit event", async () => {
+      setupMockPayPalFetch();
+
+      const callCountBefore = paypalGetOrderCallCount;
+      const req = new Request("http://localhost:3000/api/demo/sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ orderId: "ORDER-LIVE-554433" }),
+      });
+
+      const res = await syncRoute(req);
+      assert(res.status === 200, `Expected status 200, got ${res.status}`);
+      const data = await res.json();
+      assert(data.success === true, "Must succeed when genuine order ID is provided");
+      assert(data.order.id === "ORDER-LIVE-554433", "Must return synced order");
+      assert(paypalGetOrderCallCount === callCountBefore + 1, "PayPal getOrder must be called exactly once");
+
+      const entries = auditLedger.getEntries();
+      const syncEntry = entries.find((e) => e.type === "ONE_SHOT_SANDBOX_SYNC" && e.payload.orderId === "ORDER-LIVE-554433");
+      assert(syncEntry !== undefined, "Audit ledger must record ONE_SHOT_SANDBOX_SYNC");
+    });
+
+    // -------------------------------------------------------------
+    // Test 21: Refund route rejects mock/demo capture IDs before calling PayPal
+    // -------------------------------------------------------------
+    await testCase("POST /api/disputes/refund: Rejects mock/demo capture ID with HTTP 400 before PayPal call", async () => {
+      setupMockPayPalFetch();
+
+      const getCaptureCallsBefore = paypalGetCaptureCallCount;
+      const refundCallsBefore = paypalRefundApiCallCount;
+
+      const req = new Request("http://localhost:3000/api/disputes/refund", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: "neg-demo-seed",
+          captureId: "78B991204X518204K",
+          amount: 24.0,
+          decision: "partial_refund",
+        }),
+      });
+
+      const res = await refundRoute(req);
+      assert(res.status === 400, `Expected status 400, got ${res.status}`);
+      const data = await res.json();
+      assert(data.error.includes("simulated demo placeholder"), "Error must state captureId is a simulated demo placeholder");
+      assert(paypalGetCaptureCallCount === getCaptureCallsBefore, "getCapture must NOT be called for demo placeholder");
+      assert(paypalRefundApiCallCount === refundCallsBefore, "refundCapture must NOT be called for demo placeholder");
     });
 
   } finally {

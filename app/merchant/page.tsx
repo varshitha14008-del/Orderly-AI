@@ -86,9 +86,18 @@ export default function MerchantHubPage() {
   const handleExecuteRefund = async () => {
     if (!recommendation) return;
     const session = sessions.find((s) => s.id === selectedSessionId);
-    const captureId = session?.paypalCaptureId || "MOCK_SANDBOX_CAPTURE";
 
     const isContest = recommendation.decision === "contest" || recommendation.refund_amount === 0;
+    const captureId = session?.paypalCaptureId || (isContest ? "N/A" : null);
+
+    if (!isContest && !captureId) {
+      setRefundStatus(
+        "Cannot execute refund: This deal is a demo simulation without an active PayPal capture. Complete checkout in the Buyer Portal to test real PayPal refunds."
+      );
+      return;
+    }
+
+
     setRefundStatus(
       isContest
         ? "Recording Mediator contest ruling..."

@@ -48,10 +48,10 @@ export async function POST() {
 
   session.status = "COMPLETED";
   session.agreedPrice = 48.0;
-  session.paypalOrderId = "49A309481M497412U";
-  session.paypalCaptureId = "78B991204X518204K";
+  session.paypalOrderId = null;
+  session.paypalCaptureId = null;
 
-  // Record audit events
+  // Record audit events for negotiation agreement
   auditLedger.record("buyer_agent", "PROPOSAL_ACCEPTED_BY_POLICY", {
     sessionId: session.id,
     price: 48.0,
@@ -61,16 +61,17 @@ export async function POST() {
     sessionId: session.id,
     agreedPrice: 48.0,
   });
-  auditLedger.record("paypal_api", "PAYMENT_CAPTURE_COMPLETED", {
+  auditLedger.record("system", "DEMO_COMPLETED_DEAL_SEEDED", {
     sessionId: session.id,
-    orderId: "49A309481M497412U",
-    captureId: "78B991204X518204K",
-    status: "COMPLETED",
+    productId: session.product.id,
+    agreedPrice: 48.0,
+    hasRealPayPalPayment: false,
+    note: "Seeded realistic completed negotiation deal for demo evaluation without live PayPal payment.",
   });
 
   return NextResponse.json({
     success: true,
-    message: "Seeded complete negotiation deal with live verified sandbox order.",
+    message: "Seeded complete negotiation deal for demo evaluation (no live PayPal payment attached).",
     session,
   });
 }

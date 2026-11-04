@@ -8,9 +8,39 @@ export async function POST(req: Request) {
     const body = await req.json().catch(() => ({}));
     const { orderId } = body;
 
-    const targetOrderId = orderId || "49A309481M497412U";
+    // Resolve target order ID from request or active sessions with genuine PayPal orders
+    let targetOrderId = typeof orderId === "string" && orderId.trim() ? orderId.trim() : null;
 
-    // Call live PayPal sandbox
+    if (!targetOrderId) {
+      const activeSessions = NegotiationManager.getAllSessions();
+      const sessionWithRealOrder = activeSessions.find(
+        (s) =>
+          s.paypalOrderId &&
+          s.paypalOrderId !== "49A309481M497412U" &&
+          !s.paypalOrderId.startsWith("DEMO_") &&
+          !s.paypalOrderId.startsWith("MOCK_")
+      );
+      if (sessionWithRealOrder) {
+        targetOrderId = sessionWithRealOrder.paypalOrderId;
+      }
+    }
+
+    // If no genuine PayPal order ID exists or is a known demo placeholder, do not call PayPal
+    if (
+      !targetOrderId ||
+      targetOrderId === "49A309481M497412U" ||
+      targetOrderId.startsWith("DEMO_") ||
+      targetOrderId.startsWith("MOCK_")
+    ) {
+      return NextResponse.json({
+        success: false,
+        synced: false,
+        message:
+          "This demo deal has no real PayPal order to sync. Complete checkout in the Buyer Portal to create and sync a live PayPal Sandbox order.",
+      });
+    }
+
+    // Call live PayPal sandbox with genuine order ID
     const liveOrder = await getOrder(targetOrderId);
 
     auditLedger.record("paypal_api", "ONE_SHOT_SANDBOX_SYNC", {

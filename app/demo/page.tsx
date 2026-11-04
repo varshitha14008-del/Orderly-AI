@@ -58,7 +58,7 @@ export default function DemoControlPage() {
       const res = await fetch("/api/demo/sync", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ orderId: "49A309481M497412U" }),
+        body: JSON.stringify({}),
       });
       const data = await res.json();
       if (data.order) {
@@ -66,7 +66,7 @@ export default function DemoControlPage() {
           `✓ PayPal Sandbox Synced! Order ${data.order.id} is ${data.order.status} for ${data.order.purchase_units?.[0]?.amount?.value} ${data.order.purchase_units?.[0]?.amount?.currency_code}. Recorded in audit log.`
         );
       } else {
-        setActionOutput(`Sync response: ${data.error}`);
+        setActionOutput(`Sync response: ${data.message || data.error}`);
       }
     } catch (err: any) {
       setActionOutput(`Sync failed: ${err.message}`);
@@ -103,8 +103,8 @@ export default function DemoControlPage() {
             </div>
             <h2 className="text-base font-bold text-white">Seed Golden Demo Deal</h2>
             <p className="text-xs text-slate-400 leading-relaxed">
-              Populates a multi-turn negotiated keyboard deal, pre-linked with live PayPal Sandbox Order{" "}
-              <code className="text-cyan-300 font-mono">49A309481M497412U</code>.
+              Populates a realistic multi-round negotiated keyboard deal for rapid evaluation and testing.
+
             </p>
           </div>
 
