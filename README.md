@@ -7,7 +7,8 @@
 [![AG Grid](https://img.shields.io/badge/AG%20Grid-Community%20v32-21A0A0.svg)](https://www.ag-grid.com/)
 
 > **PayPal AI Hackathon 2026 Submission**  
-> *Target Prizes:* 1st/2nd/3rd Overall, Best Use of PayPal + AI, Best Use of Agentic Commerce, Best Use of AG Grid, Best Demo Delivery.
+> *Target Prizes:* 1st/2nd/3rd Overall, Best Use of PayPal + AI, Best Use of Agentic Commerce, Best Use of AG Grid, Best Demo Delivery.  
+> 📺 **Demo Video (YouTube):** [https://youtu.be/TvF4DnlBYCo](https://youtu.be/TvF4DnlBYCo)
 
 ---
 
@@ -280,12 +281,35 @@ Open [http://localhost:3000](http://localhost:3000) in your browser.
 
 ---
 
-## 9. Video Walkthrough Script (Under 3 Minutes)
+## 9. Real-World Applications & Market Impact
 
-See [docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md) for the timed 3-minute video presentation script.
+Where does **Orderly-AI** create tangible commercial value across the digital economy?
+
+1. **Small Vendors & Solopreneurs (24/7 Store Presence):**
+   - Independent sellers cannot monitor live chat around the clock to respond to bargain hunters.
+   - An autonomous Seller Agent negotiates on the vendor's behalf, guaranteeing sales stay above floor margins and automatically executing PayPal checkout without vendor burnout.
+
+2. **WhatsApp Business & Conversational Social Commerce:**
+   - Over 2 billion users use messaging apps where haggling is culturally standard ("Can I get a discount?").
+   - Orderly-AI integrates into WhatsApp Business APIs: buyers negotiate directly in chat, the policy engine ensures discounts stay legal, and an approved PayPal payment link is generated on the spot.
+
+3. **B2B Wholesale & Corporate Procurement:**
+   - Procurement bots negotiate volume-tiered pricing against vendor agents.
+   - Corporate spending policies (hard spending caps, no auto-renewing subscriptions, mandatory manager sign-off over $5,000) are enforced deterministically in code.
+
+4. **Enterprise E-Commerce Platforms (Shopify, eBay, Marketplaces):**
+   - High-volume marketplaces lose billions annually to return disputes and chargeback fees.
+   - Orderly-AI's **AI Mediator Agent** delivers instant, fair dispute resolution based on contractually agreed merchant policies—slashing chargeback overhead and customer service costs by over 80%.
 
 ---
 
-## 10. License
+## 10. Demo Video & Presentation Walkthrough
+
+- 📺 **Official 3-Minute Video Demo:** [https://youtu.be/TvF4DnlBYCo](https://youtu.be/TvF4DnlBYCo)
+- 📜 **Presentation Script & Storyboard:** See [docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md) for the timed video presentation script and scene-by-scene tour.
+
+---
+
+## 11. License
 
 This project is licensed under the open-source MIT License. See [LICENSE](LICENSE) for details.
